@@ -284,10 +284,39 @@ param(
 
 begin {
     if (-not $DetectOnly -and -not $PSBoundParameters.ContainsKey('Monitors')) {
-        $Monitors = @(
-            '[2] Philips 278B1 (27inch Wide LCD MONITOR )'
-            '[3] Philips 278B1 (27inch Wide LCD MONITOR )'
+        $defaultMonitorSerialNumbers = @(
+            'UKC2035000146'
+            'UKC2035000138'
         )
+
+        $scriptPath = $PSCommandPath
+        if (-not [string]::IsNullOrWhiteSpace($scriptPath) -and (Test-Path -LiteralPath $scriptPath)) {
+            try {
+                $detectedDefaultMonitors = @(& $scriptPath -DetectOnly -Json 2>$null | ConvertFrom-Json)
+            }
+            catch {
+                $detectedDefaultMonitors = @()
+            }
+
+            $matchedDefaultMonitors = @(
+                $detectedDefaultMonitors |
+                Where-Object { $defaultMonitorSerialNumbers -contains ([string]$_.SerialNumber) } |
+                Sort-Object -Property @{ Expression = { [array]::IndexOf($defaultMonitorSerialNumbers, [string]$_.SerialNumber) }; Descending = $false }
+            )
+
+            if ($matchedDefaultMonitors.Count -gt 0) {
+                $Monitors = @(
+                    foreach ($matchedDefaultMonitor in $matchedDefaultMonitors) {
+                        $resolvedDescription = [string]$matchedDefaultMonitor.ResolvedDescription
+                        if ([string]::IsNullOrWhiteSpace($resolvedDescription)) {
+                            $resolvedDescription = [string]$matchedDefaultMonitor.Description
+                        }
+
+                        '[{0}] {1}' -f ([string]$matchedDefaultMonitor.Id), $resolvedDescription
+                    }
+                )
+            }
+        }
     }
 }
 
@@ -2083,7 +2112,7 @@ System.Int32
         throw "Unable to parse VCP value from winddcutil output for monitor $MonitorId and code $Code. Output: $rawValue"
     }
 
-    function Normalize-VcpValueForComparison {
+    function Convert-VcpValueForComparison {
         [CmdletBinding()]
         param(
             [Parameter(Mandatory)]
@@ -2144,8 +2173,8 @@ Attempts to switch display 3 to the requested input source.
         for ($attempt = 1; $attempt -le $SetVcpRetryCount; $attempt++) {
             try {
                 Invoke-Winddcutil -SetVcp -Display $MonitorId -FeatureCode $Code -NewValue $Value | Out-Null
-                $expectedValue = Normalize-VcpValueForComparison -Code $Code -Value (Convert-VcpValueToInt -Value $Value)
-                $currentValue = Normalize-VcpValueForComparison -Code $Code -Value (Get-MonitorVcpValue -MonitorId $MonitorId -Code $Code)
+                $expectedValue = Convert-VcpValueForComparison -Code $Code -Value (Convert-VcpValueToInt -Value $Value)
+                $currentValue = Convert-VcpValueForComparison -Code $Code -Value (Get-MonitorVcpValue -MonitorId $MonitorId -Code $Code)
 
                 if ($currentValue -ne $expectedValue) {
                     throw "Monitor $MonitorId reported VCP code $Code value $currentValue after setting $expectedValue."
