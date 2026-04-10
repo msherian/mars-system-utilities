@@ -183,7 +183,7 @@ function Get-ScheduledTaskContextForCurrentProcess {
         return $null
     }
 
-    $matches = @(
+    $matchingLaunchEvents = @(
         foreach ($launchEvent in $launchEvents) {
             $eventData = Get-TaskSchedulerEventData -EventRecord $launchEvent
             $processId = 0
@@ -208,7 +208,7 @@ function Get-ScheduledTaskContextForCurrentProcess {
     )
 
     $selected = @(
-        $matches |
+        $matchingLaunchEvents |
         Sort-Object -Property @{ Expression = 'IsCurrentProcess'; Descending = $true }, @{ Expression = 'Delta'; Descending = $false }, @{ Expression = { $_.Event.TimeCreated }; Descending = $true }
     ) | Select-Object -First 1
 
@@ -407,7 +407,7 @@ function Get-ScheduledTaskCompletionEvent {
         } -ErrorAction SilentlyContinue
     )
 
-    $matches = @(
+    $matchingCompletionEvents = @(
         foreach ($historyEvent in $historyEvents) {
             $historyData = Get-TaskSchedulerEventData -EventRecord $historyEvent
             if ([string]$historyData.TaskName -ne $TaskName) {
@@ -434,7 +434,7 @@ function Get-ScheduledTaskCompletionEvent {
     )
 
     return @(
-        $matches |
+        $matchingCompletionEvents |
         Sort-Object -Property @{ Expression = { $_.Event.TimeCreated }; Descending = $true }
     ) | Select-Object -First 1
 }
