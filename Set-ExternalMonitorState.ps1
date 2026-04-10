@@ -175,11 +175,17 @@ param(
                 [string]$fakeBoundParameters.DdcUtilPath
             }
             else {
-                $managedInstallRoot = Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Programs\winddcutil'
-                $managedInstallPath = $null
+                $managedInstallPaths = @(
+                    Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Programs\winddcutil'
+                    Join-Path -Path ${env:ProgramFiles} -ChildPath 'winddcutil'
+                )
 
-                if (Test-Path -LiteralPath $managedInstallRoot -PathType Container) {
-                    $managedInstallPath = @(
+                @(
+                    foreach ($managedInstallRoot in $managedInstallPaths) {
+                        if (-not (Test-Path -LiteralPath $managedInstallRoot -PathType Container)) {
+                            continue
+                        }
+
                         Get-ChildItem -LiteralPath $managedInstallRoot -Directory -ErrorAction SilentlyContinue |
                         ForEach-Object {
                             $candidatePath = Join-Path -Path $_.FullName -ChildPath 'bin\winddcutil.exe'
@@ -194,12 +200,11 @@ param(
                                     Path    = $candidatePath
                                 }
                             }
-                        } |
-                        Sort-Object -Property Version -Descending
-                    ) | Select-Object -First 1 -ExpandProperty Path
-                }
-
-                $managedInstallPath
+                        }
+                    }
+                ) |
+                Sort-Object -Property Version -Descending |
+                Select-Object -First 1 -ExpandProperty Path
             }
 
             if ([string]::IsNullOrWhiteSpace($ddcUtilPath) -or -not (Test-Path -LiteralPath $ddcUtilPath -PathType Leaf)) {
@@ -478,11 +483,59 @@ Writes an informational log entry.
         }
     }
 
-    function Get-WinddcutilInstallRoot {
+    function Test-WinddcutilSystemInstallContext {
         [CmdletBinding()]
         param()
 
+        $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $currentIdentityName = [string]$currentIdentity.Name
+        if ($currentIdentityName -ieq 'NT AUTHORITY\SYSTEM' -or $currentIdentityName -ieq 'NT SERVICE\TrustedInstaller') {
+            return $true
+        }
+
+        $principal = [System.Security.Principal.WindowsPrincipal]::new($currentIdentity)
+        return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+
+    function Get-WinddcutilInstallScope {
+        [CmdletBinding()]
+        param()
+
+        if (Test-WinddcutilSystemInstallContext) {
+            return 'Machine'
+        }
+
+        return 'User'
+    }
+
+    function Get-WinddcutilInstallRoot {
+        [CmdletBinding()]
+        param(
+            [string]$Scope = (Get-WinddcutilInstallScope)
+        )
+
+        if ($Scope -eq 'Machine') {
+            return (Join-Path -Path ${env:ProgramFiles} -ChildPath 'winddcutil')
+        }
+
         return (Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Programs\winddcutil')
+    }
+
+    function Get-WinddcutilInstallRoots {
+        [CmdletBinding()]
+        param()
+
+        if ((Get-WinddcutilInstallScope) -eq 'Machine') {
+            return @(
+                Get-WinddcutilInstallRoot -Scope 'Machine'
+                Get-WinddcutilInstallRoot -Scope 'User'
+            )
+        }
+
+        return @(
+            Get-WinddcutilInstallRoot -Scope 'User'
+            Get-WinddcutilInstallRoot -Scope 'Machine'
+        )
     }
 
     function ConvertTo-NormalizedWinddcutilVersion {
@@ -504,53 +557,59 @@ Writes an informational log entry.
         [CmdletBinding()]
         param(
             [Parameter(Mandatory)]
-            [string]$Version
+            [string]$Version,
+
+            [string]$Scope = (Get-WinddcutilInstallScope)
         )
 
         $normalizedVersion = ConvertTo-NormalizedWinddcutilVersion -Version $Version
-        return (Join-Path -Path (Get-WinddcutilInstallRoot) -ChildPath (Join-Path -Path $normalizedVersion -ChildPath 'bin\winddcutil.exe'))
+        return (Join-Path -Path (Get-WinddcutilInstallRoot -Scope $Scope) -ChildPath (Join-Path -Path $normalizedVersion -ChildPath 'bin\winddcutil.exe'))
     }
 
     function Get-WinddcutilHomeForVersion {
         [CmdletBinding()]
         param(
             [Parameter(Mandatory)]
-            [string]$Version
+            [string]$Version,
+
+            [string]$Scope = (Get-WinddcutilInstallScope)
         )
 
         $normalizedVersion = ConvertTo-NormalizedWinddcutilVersion -Version $Version
-        return (Join-Path -Path (Get-WinddcutilInstallRoot) -ChildPath $normalizedVersion)
+        return (Join-Path -Path (Get-WinddcutilInstallRoot -Scope $Scope) -ChildPath $normalizedVersion)
     }
 
     function Get-InstalledWinddcutilPath {
         [CmdletBinding()]
         param()
 
-        $installRoot = Get-WinddcutilInstallRoot
-        if (-not (Test-Path -LiteralPath $installRoot -PathType Container)) {
-            return $null
-        }
-
         $installedVersion = @(
-            Get-ChildItem -LiteralPath $installRoot -Directory -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                $candidatePath = Join-Path -Path $_.FullName -ChildPath 'bin\winddcutil.exe'
-                if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
-                    return
+            foreach ($installRoot in @(Get-WinddcutilInstallRoots)) {
+                if (-not (Test-Path -LiteralPath $installRoot -PathType Container)) {
+                    continue
                 }
 
-                $version = $null
-                if (-not [version]::TryParse($_.Name.TrimStart('v', 'V'), [ref]$version)) {
-                    return
-                }
+                Get-ChildItem -LiteralPath $installRoot -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    $candidatePath = Join-Path -Path $_.FullName -ChildPath 'bin\winddcutil.exe'
+                    if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+                        return
+                    }
 
-                [pscustomobject]@{
-                    Version = $version
-                    Path    = $candidatePath
+                    $version = $null
+                    if (-not [version]::TryParse($_.Name.TrimStart('v', 'V'), [ref]$version)) {
+                        return
+                    }
+
+                    [pscustomobject]@{
+                        Version = $version
+                        Path    = $candidatePath
+                    }
                 }
-            } |
-            Sort-Object -Property Version -Descending
-        ) | Select-Object -First 1
+            }
+        ) |
+        Sort-Object -Property Version -Descending |
+        Select-Object -First 1
 
         if ($null -eq $installedVersion) {
             return $null
@@ -581,29 +640,34 @@ Writes an informational log entry.
         }
 
         $normalizedVersion = ConvertTo-NormalizedWinddcutilVersion -Version ([string]$release.tag_name)
+        $installScope = Get-WinddcutilInstallScope
 
         return [pscustomobject]@{
             Version     = $normalizedVersion
             DownloadUrl = [string]$asset.browser_download_url
-            InstallHome = Get-WinddcutilHomeForVersion -Version $normalizedVersion
-            InstallPath = Get-WinddcutilInstallPathForVersion -Version $normalizedVersion
+            InstallScope = $installScope
+            InstallHome = Get-WinddcutilHomeForVersion -Version $normalizedVersion -Scope $installScope
+            InstallPath = Get-WinddcutilInstallPathForVersion -Version $normalizedVersion -Scope $installScope
         }
     }
 
-    function Update-WinddcutilUserEnvironment {
+    function Update-WinddcutilEnvironment {
         [CmdletBinding()]
         param(
             [Parameter(Mandatory)]
-            [string]$InstallHome
+            [string]$InstallHome,
+
+            [ValidateSet('User', 'Machine')]
+            [string]$Scope
         )
 
         $pathEntry = '%WINDDCUTIL_HOME%\bin'
-        [Environment]::SetEnvironmentVariable('WINDDCUTIL_HOME', $InstallHome, 'User')
+        [Environment]::SetEnvironmentVariable('WINDDCUTIL_HOME', $InstallHome, $Scope)
         $env:WINDDCUTIL_HOME = $InstallHome
 
-        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $persistedPath = [Environment]::GetEnvironmentVariable('Path', $Scope)
         $pathEntries = @(
-            @([string]$userPath -split ';') |
+            @([string]$persistedPath -split ';') |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
         )
 
@@ -620,7 +684,7 @@ Writes an informational log entry.
 
         if (-not $hasPathEntry) {
             $updatedPathEntries = @($pathEntries + $pathEntry)
-            [Environment]::SetEnvironmentVariable('Path', ($updatedPathEntries -join ';'), 'User')
+            [Environment]::SetEnvironmentVariable('Path', ($updatedPathEntries -join ';'), $Scope)
 
             $processPathEntries = @(
                 @([string]$env:Path -split ';') |
@@ -640,6 +704,7 @@ Writes an informational log entry.
         $releaseInfo = Get-LatestWinddcutilReleaseInfo
         $installHome = [string]$releaseInfo.InstallHome
         $installPath = [string]$releaseInfo.InstallPath
+        $installScope = [string]$releaseInfo.InstallScope
 
         if (Test-Path -LiteralPath $installPath -PathType Leaf) {
             return (Get-Item -LiteralPath $installPath -ErrorAction Stop).FullName
@@ -664,7 +729,7 @@ Writes an informational log entry.
             throw "Failed to install winddcutil $($releaseInfo.Version) to '$installPath'. $($_.Exception.Message)"
         }
 
-        Update-WinddcutilUserEnvironment -InstallHome $installHome
+        Update-WinddcutilEnvironment -InstallHome $installHome -Scope $installScope
 
         return (Get-Item -LiteralPath $installPath -ErrorAction Stop).FullName
     }
