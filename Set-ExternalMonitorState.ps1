@@ -511,6 +511,17 @@ Writes an informational log entry.
         return (Join-Path -Path (Get-WinddcutilInstallRoot) -ChildPath (Join-Path -Path $normalizedVersion -ChildPath 'bin\winddcutil.exe'))
     }
 
+    function Get-WinddcutilHomeForVersion {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [string]$Version
+        )
+
+        $normalizedVersion = ConvertTo-NormalizedWinddcutilVersion -Version $Version
+        return (Join-Path -Path (Get-WinddcutilInstallRoot) -ChildPath $normalizedVersion)
+    }
+
     function Get-InstalledWinddcutilPath {
         [CmdletBinding()]
         param()
@@ -574,7 +585,51 @@ Writes an informational log entry.
         return [pscustomobject]@{
             Version     = $normalizedVersion
             DownloadUrl = [string]$asset.browser_download_url
+            InstallHome = Get-WinddcutilHomeForVersion -Version $normalizedVersion
             InstallPath = Get-WinddcutilInstallPathForVersion -Version $normalizedVersion
+        }
+    }
+
+    function Update-WinddcutilUserEnvironment {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [string]$InstallHome
+        )
+
+        $pathEntry = '%WINDDCUTIL_HOME%\bin'
+        [Environment]::SetEnvironmentVariable('WINDDCUTIL_HOME', $InstallHome, 'User')
+        $env:WINDDCUTIL_HOME = $InstallHome
+
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $pathEntries = @(
+            @([string]$userPath -split ';') |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+
+        $hasPathEntry = $false
+        foreach ($existingPathEntry in $pathEntries) {
+            if (
+                $existingPathEntry.Trim().TrimEnd('\') -ieq $pathEntry.Trim().TrimEnd('\') -or
+                $existingPathEntry.Trim().TrimEnd('\') -ieq (Join-Path -Path $InstallHome -ChildPath 'bin').TrimEnd('\')
+            ) {
+                $hasPathEntry = $true
+                break
+            }
+        }
+
+        if (-not $hasPathEntry) {
+            $updatedPathEntries = @($pathEntries + $pathEntry)
+            [Environment]::SetEnvironmentVariable('Path', ($updatedPathEntries -join ';'), 'User')
+
+            $processPathEntries = @(
+                @([string]$env:Path -split ';') |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            )
+
+            if ($processPathEntries -notcontains (Join-Path -Path $InstallHome -ChildPath 'bin')) {
+                $env:Path = (@($processPathEntries + (Join-Path -Path $InstallHome -ChildPath 'bin')) -join ';')
+            }
         }
     }
 
@@ -583,6 +638,7 @@ Writes an informational log entry.
         param()
 
         $releaseInfo = Get-LatestWinddcutilReleaseInfo
+        $installHome = [string]$releaseInfo.InstallHome
         $installPath = [string]$releaseInfo.InstallPath
 
         if (Test-Path -LiteralPath $installPath -PathType Leaf) {
@@ -607,6 +663,8 @@ Writes an informational log entry.
 
             throw "Failed to install winddcutil $($releaseInfo.Version) to '$installPath'. $($_.Exception.Message)"
         }
+
+        Update-WinddcutilUserEnvironment -InstallHome $installHome
 
         return (Get-Item -LiteralPath $installPath -ErrorAction Stop).FullName
     }

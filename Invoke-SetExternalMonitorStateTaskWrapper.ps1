@@ -333,7 +333,7 @@ function Get-ScheduledTaskTriggerClassification {
     }
 
     $recentLogonEvent = $null
-    $logonDetectionWindow = [TimeSpan]::FromSeconds(120)
+    $logonDetectionWindow = [TimeSpan]::FromSeconds(30)
 
     if ($supportsLogonTrigger -and $referenceTime -is [datetime]) {
         try {
