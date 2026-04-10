@@ -10,7 +10,9 @@ their input source to the configured target. The script writes operational log e
 the configured log file and exits with a non-zero code if any required step fails.
 
 .PARAMETER DdcUtilPath
-Full path to winddcutil.exe.
+Full path to winddcutil.exe. When omitted, the script uses the newest managed
+install under LocalAppData and installs the latest GitHub release there on
+first use.
 
 .PARAMETER Monitors
 Resolved monitor selections to target in the switch workflow. Tab completion is
@@ -54,7 +56,8 @@ to the corresponding VCP code expected by winddcutil. Repeated identical values
 are accepted, but only one distinct input source can be applied per run.
 
 .PARAMETER DetectOnly
-Runs monitor detection only and outputs matching monitor objects instead of changing monitor state.
+Runs monitor detection only and outputs matching monitor objects, including
+friendly current and available input source names, instead of changing monitor state.
 
 .PARAMETER Json
 When used with DetectOnly, outputs the detected monitor objects as JSON.
@@ -92,7 +95,8 @@ Puts matching monitors into sleep mode before switching their input source.
 .EXAMPLE
 .\Set-ExternalMonitorState.ps1 -DetectOnly
 
-Outputs matching detected monitors as PowerShell objects.
+Outputs matching detected monitors as PowerShell objects, including friendly
+current and available input source names.
 
 .EXAMPLE
 .\Set-ExternalMonitorState.ps1 -DetectOnly -Json
@@ -147,7 +151,7 @@ param(
             }
         })]
     [string[]]$Monitors,
-    [string]$DdcUtilPath = 'C:\programs\winddcutil\winddcutil.exe',
+    [string]$DdcUtilPath,
     [string]$LogDirectory = 'C:\Windows\Logs\Set-ExternalMonitorState',
     [string]$LogFileName = 'Set-ExternalMonitorState.log',
     [int]$DetectRetryCount = 12,
@@ -171,10 +175,34 @@ param(
                 [string]$fakeBoundParameters.DdcUtilPath
             }
             else {
-                'C:\programs\winddcutil\winddcutil.exe'
+                $managedInstallRoot = Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Programs\winddcutil'
+                $managedInstallPath = $null
+
+                if (Test-Path -LiteralPath $managedInstallRoot -PathType Container) {
+                    $managedInstallPath = @(
+                        Get-ChildItem -LiteralPath $managedInstallRoot -Directory -ErrorAction SilentlyContinue |
+                        ForEach-Object {
+                            $candidatePath = Join-Path -Path $_.FullName -ChildPath 'bin\winddcutil.exe'
+                            if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+                                return
+                            }
+
+                            $version = $null
+                            if ([version]::TryParse($_.Name.TrimStart('v', 'V'), [ref]$version)) {
+                                [pscustomobject]@{
+                                    Version = $version
+                                    Path    = $candidatePath
+                                }
+                            }
+                        } |
+                        Sort-Object -Property Version -Descending
+                    ) | Select-Object -First 1 -ExpandProperty Path
+                }
+
+                $managedInstallPath
             }
 
-            if (-not (Test-Path -LiteralPath $ddcUtilPath -PathType Leaf)) {
+            if ([string]::IsNullOrWhiteSpace($ddcUtilPath) -or -not (Test-Path -LiteralPath $ddcUtilPath -PathType Leaf)) {
                 return
             }
 
@@ -450,6 +478,196 @@ Writes an informational log entry.
         }
     }
 
+    function Get-WinddcutilInstallRoot {
+        [CmdletBinding()]
+        param()
+
+        return (Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Programs\winddcutil')
+    }
+
+    function ConvertTo-NormalizedWinddcutilVersion {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [string]$Version
+        )
+
+        $trimmedVersion = $Version.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmedVersion)) {
+            throw 'winddcutil version is null or empty.'
+        }
+
+        return $trimmedVersion.TrimStart('v', 'V')
+    }
+
+    function Get-WinddcutilInstallPathForVersion {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [string]$Version
+        )
+
+        $normalizedVersion = ConvertTo-NormalizedWinddcutilVersion -Version $Version
+        return (Join-Path -Path (Get-WinddcutilInstallRoot) -ChildPath (Join-Path -Path $normalizedVersion -ChildPath 'bin\winddcutil.exe'))
+    }
+
+    function Get-InstalledWinddcutilPath {
+        [CmdletBinding()]
+        param()
+
+        $installRoot = Get-WinddcutilInstallRoot
+        if (-not (Test-Path -LiteralPath $installRoot -PathType Container)) {
+            return $null
+        }
+
+        $installedVersion = @(
+            Get-ChildItem -LiteralPath $installRoot -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $candidatePath = Join-Path -Path $_.FullName -ChildPath 'bin\winddcutil.exe'
+                if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+                    return
+                }
+
+                $version = $null
+                if (-not [version]::TryParse($_.Name.TrimStart('v', 'V'), [ref]$version)) {
+                    return
+                }
+
+                [pscustomobject]@{
+                    Version = $version
+                    Path    = $candidatePath
+                }
+            } |
+            Sort-Object -Property Version -Descending
+        ) | Select-Object -First 1
+
+        if ($null -eq $installedVersion) {
+            return $null
+        }
+
+        return [string]$installedVersion.Path
+    }
+
+    function Get-LatestWinddcutilReleaseInfo {
+        [CmdletBinding()]
+        param()
+
+        $releaseUri = 'https://api.github.com/repos/scottaxcell/winddcutil/releases/latest'
+
+        try {
+            $release = Invoke-RestMethod -Uri $releaseUri -Headers @{
+                'Accept' = 'application/vnd.github+json'
+                'User-Agent' = 'Set-ExternalMonitorState'
+            } -ErrorAction Stop
+        }
+        catch {
+            throw "Failed to query the latest winddcutil release from '$releaseUri'. $($_.Exception.Message)"
+        }
+
+        $asset = @($release.assets | Where-Object { $_.name -eq 'winddcutil.exe' }) | Select-Object -First 1
+        if ($null -eq $asset -or [string]::IsNullOrWhiteSpace([string]$asset.browser_download_url)) {
+            throw 'The latest winddcutil release did not expose a winddcutil.exe asset.'
+        }
+
+        $normalizedVersion = ConvertTo-NormalizedWinddcutilVersion -Version ([string]$release.tag_name)
+
+        return [pscustomobject]@{
+            Version     = $normalizedVersion
+            DownloadUrl = [string]$asset.browser_download_url
+            InstallPath = Get-WinddcutilInstallPathForVersion -Version $normalizedVersion
+        }
+    }
+
+    function Install-Winddcutil {
+        [CmdletBinding()]
+        param()
+
+        $releaseInfo = Get-LatestWinddcutilReleaseInfo
+        $installPath = [string]$releaseInfo.InstallPath
+
+        if (Test-Path -LiteralPath $installPath -PathType Leaf) {
+            return (Get-Item -LiteralPath $installPath -ErrorAction Stop).FullName
+        }
+
+        $installDirectory = Split-Path -Path $installPath -Parent
+        if (-not (Test-Path -LiteralPath $installDirectory -PathType Container)) {
+            New-Item -Path $installDirectory -ItemType Directory -Force | Out-Null
+        }
+
+        $temporaryDownloadPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ([System.IO.Path]::GetRandomFileName())
+
+        try {
+            Invoke-WebRequest -Uri $releaseInfo.DownloadUrl -OutFile $temporaryDownloadPath -Headers @{ 'User-Agent' = 'Set-ExternalMonitorState' } -ErrorAction Stop
+            Move-Item -LiteralPath $temporaryDownloadPath -Destination $installPath -Force
+        }
+        catch {
+            if (Test-Path -LiteralPath $temporaryDownloadPath -PathType Leaf) {
+                Remove-Item -LiteralPath $temporaryDownloadPath -Force -ErrorAction SilentlyContinue
+            }
+
+            throw "Failed to install winddcutil $($releaseInfo.Version) to '$installPath'. $($_.Exception.Message)"
+        }
+
+        return (Get-Item -LiteralPath $installPath -ErrorAction Stop).FullName
+    }
+
+    function Resolve-ExistingWinddcutilPath {
+        [CmdletBinding()]
+        param(
+            [AllowEmptyString()]
+            [AllowNull()]
+            [string]$RequestedPath,
+
+            [switch]$WasExplicitlyProvided
+        )
+
+        if ($WasExplicitlyProvided) {
+            if ([string]::IsNullOrWhiteSpace($RequestedPath)) {
+                throw 'DdcUtilPath is null or empty.'
+            }
+
+            if (-not (Test-Path -LiteralPath $RequestedPath -PathType Leaf)) {
+                throw "winddcutil not found at '$RequestedPath'."
+            }
+
+            return (Get-Item -LiteralPath $RequestedPath -ErrorAction Stop).FullName
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($RequestedPath) -and (Test-Path -LiteralPath $RequestedPath -PathType Leaf)) {
+            return (Get-Item -LiteralPath $RequestedPath -ErrorAction Stop).FullName
+        }
+
+        $installedPath = Get-InstalledWinddcutilPath
+        if (-not [string]::IsNullOrWhiteSpace($installedPath)) {
+            return $installedPath
+        }
+
+        $command = Get-Command -Name 'winddcutil.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace([string]$command.Source)) {
+            return [string]$command.Source
+        }
+
+        return $null
+    }
+
+    function Resolve-WinddcutilPath {
+        [CmdletBinding()]
+        param(
+            [AllowEmptyString()]
+            [AllowNull()]
+            [string]$RequestedPath,
+
+            [switch]$WasExplicitlyProvided
+        )
+
+        $resolvedPath = Resolve-ExistingWinddcutilPath -RequestedPath $RequestedPath -WasExplicitlyProvided:$WasExplicitlyProvided
+        if (-not [string]::IsNullOrWhiteSpace($resolvedPath)) {
+            return $resolvedPath
+        }
+
+        return (Install-Winddcutil)
+    }
+
     function Get-ProcessAncestry {
         [CmdletBinding()]
         param()
@@ -502,6 +720,8 @@ Writes an informational log entry.
                 TaskName                  = [Environment]::GetEnvironmentVariable('SET_EXTERNAL_MONITOR_TASK_NAME')
                 TaskInstanceId            = [Environment]::GetEnvironmentVariable('SET_EXTERNAL_MONITOR_TASK_INSTANCE_ID')
                 TaskActionName            = [Environment]::GetEnvironmentVariable('SET_EXTERNAL_MONITOR_TASK_ACTION_NAME')
+                TaskTriggerSource         = [Environment]::GetEnvironmentVariable('SET_EXTERNAL_MONITOR_TASK_TRIGGER_SOURCE')
+                TaskTriggerReason         = [Environment]::GetEnvironmentVariable('SET_EXTERNAL_MONITOR_TASK_TRIGGER_REASON')
                 TaskLaunchTime            = $forwardedTaskLaunchTime
                 TaskStartTime             = $forwardedTaskStartTime
                 MatchedProcessId          = $forwardedWrapperProcessId
@@ -681,7 +901,21 @@ Writes an informational log entry.
                 [string]$InvocationContext.TaskActionName
             }
 
-            Write-Log -Message "$Stage invocation context: scheduled task '$($InvocationContext.TaskName)' matched via $($InvocationContext.MatchedProcessName) [$($InvocationContext.MatchedProcessId)]. Instance: $taskInstanceText. Action: $actionText. Task history start: $taskStartTime."
+            $triggerText = if ([string]::IsNullOrWhiteSpace([string]$InvocationContext.TaskTriggerSource)) {
+                'Unknown'
+            }
+            else {
+                [string]$InvocationContext.TaskTriggerSource
+            }
+
+            $triggerReasonText = if ([string]::IsNullOrWhiteSpace([string]$InvocationContext.TaskTriggerReason)) {
+                'Trigger classification details were unavailable.'
+            }
+            else {
+                [string]$InvocationContext.TaskTriggerReason
+            }
+
+            Write-Log -Message "$Stage invocation context: scheduled task '$($InvocationContext.TaskName)' matched via $($InvocationContext.MatchedProcessName) [$($InvocationContext.MatchedProcessId)]. Trigger: $triggerText. Instance: $taskInstanceText. Action: $actionText. Task history start: $taskStartTime. $triggerReasonText"
             return
         }
 
@@ -1072,7 +1306,92 @@ Returns monitor details reported by WMIMonitorID.
         return $null
     }
 
-    function Get-MonitorSupportedInputSources {
+    function Get-MonitorInputSourceDescriptor {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [int]$Value
+        )
+
+        $normalizedHexValue = '{0:X2}' -f ($Value -band 0xFF)
+
+        switch ($normalizedHexValue) {
+            '0F' {
+                return [pscustomobject]@{
+                    Code         = '0x0F'
+                    IsKnown      = $true
+                    LegacyName   = 'DisplayPort'
+                    FriendlyName = 'DisplayPort-1'
+                }
+            }
+            '10' {
+                return [pscustomobject]@{
+                    Code         = '0x10'
+                    IsKnown      = $true
+                    LegacyName   = $null
+                    FriendlyName = 'DisplayPort-2'
+                }
+            }
+            '11' {
+                return [pscustomobject]@{
+                    Code         = '0x11'
+                    IsKnown      = $true
+                    LegacyName   = 'HDMI1'
+                    FriendlyName = 'HDMI-1'
+                }
+            }
+            '12' {
+                return [pscustomobject]@{
+                    Code         = '0x12'
+                    IsKnown      = $true
+                    LegacyName   = 'HDMI2'
+                    FriendlyName = 'HDMI-2'
+                }
+            }
+            '13' {
+                return [pscustomobject]@{
+                    Code         = '0x13'
+                    IsKnown      = $true
+                    LegacyName   = $null
+                    FriendlyName = 'HDMI-3'
+                }
+            }
+            '14' {
+                return [pscustomobject]@{
+                    Code         = '0x14'
+                    IsKnown      = $true
+                    LegacyName   = $null
+                    FriendlyName = 'HDMI-4'
+                }
+            }
+            '1B' {
+                return [pscustomobject]@{
+                    Code         = '0x1B'
+                    IsKnown      = $true
+                    LegacyName   = $null
+                    FriendlyName = 'USB-C-1'
+                }
+            }
+            '1C' {
+                return [pscustomobject]@{
+                    Code         = '0x1C'
+                    IsKnown      = $true
+                    LegacyName   = $null
+                    FriendlyName = 'USB-C-2'
+                }
+            }
+            default {
+                return [pscustomobject]@{
+                    Code         = ('0x{0}' -f $normalizedHexValue)
+                    IsKnown      = $false
+                    LegacyName   = $null
+                    FriendlyName = ('Input-{0}' -f ('0x{0}' -f $normalizedHexValue))
+                }
+            }
+        }
+    }
+
+    function Get-MonitorSupportedInputSourceDescriptors {
         [CmdletBinding()]
         param(
             [Parameter(Mandatory)]
@@ -1092,15 +1411,42 @@ Returns monitor details reported by WMIMonitorID.
         return @(
             foreach ($value in @($Matches.Values -split '\s+')) {
                 $normalizedValue = $value.Trim().ToUpperInvariant()
-                if ($InputSourceValueMap.ContainsValue(('0x{0}' -f $normalizedValue))) {
-                    foreach ($inputSourceName in $InputSourceValueMap.Keys) {
-                        if ($InputSourceValueMap[$inputSourceName].ToUpperInvariant() -eq ('0x{0}' -f $normalizedValue)) {
-                            $inputSourceName
-                        }
-                    }
+                if ($normalizedValue -notmatch '^[0-9A-F]{1,2}$') {
+                    continue
+                }
+
+                Get-MonitorInputSourceDescriptor -Value ([Convert]::ToInt32($normalizedValue, 16))
+            }
+        ) | Sort-Object -Property FriendlyName -Unique
+    }
+
+    function Get-MonitorSupportedInputSources {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [string]$MonitorId
+        )
+
+        return @(
+            foreach ($inputSourceDescriptor in @(Get-MonitorSupportedInputSourceDescriptors -MonitorId $MonitorId)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$inputSourceDescriptor.LegacyName)) {
+                    [string]$inputSourceDescriptor.LegacyName
                 }
             }
         ) | Select-Object -Unique
+    }
+
+    function Get-MonitorCurrentInputSourceDescriptor {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)]
+            [string]$MonitorId
+        )
+
+        $currentInputValue = Get-MonitorVcpValue -MonitorId $MonitorId -Code $InputSourceCode
+        $normalizedCurrentInputValue = Normalize-VcpValueForComparison -Code $InputSourceCode -Value $currentInputValue
+
+        return (Get-MonitorInputSourceDescriptor -Value $normalizedCurrentInputValue)
     }
 
     <#
@@ -1329,6 +1675,52 @@ PSCustomObject[]
         $wmiMonitorDetails = @(Get-WmiMonitorDetails)
 
         return @(Add-WmiMonitorDetails -Monitors @($detectResult) -WmiMonitorDetails $wmiMonitorDetails)
+    }
+
+    function Get-DetectOnlyMonitors {
+        [CmdletBinding()]
+        param(
+            [switch]$IgnoreExitCode
+        )
+
+        return @(
+            foreach ($resolvedMonitor in @(Get-ResolvedDetectedMonitors -IgnoreExitCode:$IgnoreExitCode)) {
+                $availableInputSourceDescriptors = @()
+                $currentInputSourceDescriptor = $null
+
+                try {
+                    $availableInputSourceDescriptors = @(Get-MonitorSupportedInputSourceDescriptors -MonitorId ([string]$resolvedMonitor.Id))
+                }
+                catch {
+                    $availableInputSourceDescriptors = @()
+                }
+
+                try {
+                    $currentInputSourceDescriptor = Get-MonitorCurrentInputSourceDescriptor -MonitorId ([string]$resolvedMonitor.Id)
+                }
+                catch {
+                    $currentInputSourceDescriptor = $null
+                }
+
+                [pscustomobject][ordered]@{
+                    Id                        = $resolvedMonitor.Id
+                    Description               = $resolvedMonitor.Description
+                    ResolvedDescription       = $resolvedMonitor.ResolvedDescription
+                    CapabilitiesModel         = $resolvedMonitor.CapabilitiesModel
+                    ComputerName              = $resolvedMonitor.ComputerName
+                    Active                    = $resolvedMonitor.Active
+                    Manufacturer              = $resolvedMonitor.Manufacturer
+                    UserFriendlyName          = $resolvedMonitor.UserFriendlyName
+                    SerialNumber              = $resolvedMonitor.SerialNumber
+                    WeekOfManufacture         = $resolvedMonitor.WeekOfManufacture
+                    YearOfManufacture         = $resolvedMonitor.YearOfManufacture
+                    CurrentInputSource        = if ($null -ne $currentInputSourceDescriptor) { [string]$currentInputSourceDescriptor.FriendlyName } else { $null }
+                    CurrentInputSourceCode    = if ($null -ne $currentInputSourceDescriptor) { [string]$currentInputSourceDescriptor.Code } else { $null }
+                    AvailableInputSources     = @($availableInputSourceDescriptors | Where-Object { $_.IsKnown } | ForEach-Object { [string]$_.FriendlyName } | Select-Object -Unique)
+                    AvailableInputSourceCodes = @($availableInputSourceDescriptors | Where-Object { $_.IsKnown } | ForEach-Object { [string]$_.Code } | Select-Object -Unique)
+                }
+            }
+        )
     }
 
     function Get-NormalizedMonitorSelections {
@@ -1753,13 +2145,12 @@ reasons that triggered the reset.
 
     try {
         $invocationContext = $null
+        $ddcUtilPathWasExplicitlyProvided = $PSBoundParameters.ContainsKey('DdcUtilPath')
 
-        if (-not (Test-Path -Path $DdcUtilPath)) {
-            throw "winddcutil not found at '$DdcUtilPath'."
-        }
+        $DdcUtilPath = Resolve-WinddcutilPath -RequestedPath $DdcUtilPath -WasExplicitlyProvided:$ddcUtilPathWasExplicitlyProvided
 
         if ($DetectOnly) {
-            $matchingMonitors = @(Get-ResolvedDetectedMonitors -IgnoreExitCode)
+            $matchingMonitors = @(Get-DetectOnlyMonitors -IgnoreExitCode)
 
             if ($Json) {
                 return ($matchingMonitors | ConvertTo-Json -Depth 6)

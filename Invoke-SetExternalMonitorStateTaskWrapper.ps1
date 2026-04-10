@@ -251,12 +251,140 @@ function Get-ScheduledTaskContextForCurrentProcess {
         }
     ) | Sort-Object -Property @{ Expression = { $_.Event.TimeCreated }; Descending = $true } | Select-Object -First 1
 
+    $resolvedTaskStartTime = if ($null -ne $taskStartEvent) {
+        [datetime]$taskStartEvent.Event.TimeCreated
+    }
+    else {
+        [datetime]$selected.Event.TimeCreated
+    }
+
+    $triggerClassification = Get-ScheduledTaskTriggerClassification -TaskName $taskName -TaskStartTime $resolvedTaskStartTime -TaskLaunchTime ([datetime]$selected.Event.TimeCreated)
+
     return [pscustomobject]@{
         TaskName       = $taskName
         TaskInstanceId = if ($null -ne $actionStartEvent) { [string]$actionStartEvent.EventData.TaskInstanceId } elseif ($null -ne $taskStartEvent) { [string]$taskStartEvent.EventData.InstanceId } else { $null }
         TaskActionName = if ($null -ne $actionStartEvent) { [string]$actionStartEvent.EventData.ActionName } else { $null }
-        TaskStartTime  = if ($null -ne $taskStartEvent) { [datetime]$taskStartEvent.Event.TimeCreated } else { [datetime]$selected.Event.TimeCreated }
+        TaskStartTime  = $resolvedTaskStartTime
         TaskLaunchTime = [datetime]$selected.Event.TimeCreated
+        TaskTriggerSource = [string]$triggerClassification.TriggerSource
+        TaskTriggerReason = [string]$triggerClassification.Reason
+    }
+}
+
+function Get-ScheduledTaskDefinitionXml {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$TaskName
+    )
+
+    $taskPath = '\'
+    $shortTaskName = $TaskName.Trim()
+
+    if ($shortTaskName -match '^(?<TaskPath>.*\\)(?<ShortTaskName>[^\\]+)$') {
+        $taskPath = [string]$Matches.TaskPath
+        $shortTaskName = [string]$Matches.ShortTaskName
+    }
+
+    try {
+        $taskDefinition = Export-ScheduledTask -TaskPath $taskPath -TaskName $shortTaskName -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($taskDefinition)) {
+            return $null
+        }
+
+        return [xml]$taskDefinition
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-ScheduledTaskTriggerClassification {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$TaskName,
+
+        [datetime]$TaskStartTime,
+
+        [datetime]$TaskLaunchTime
+    )
+
+    $taskDefinitionXml = Get-ScheduledTaskDefinitionXml -TaskName $TaskName
+    $supportsLogonTrigger = $false
+    $supportsUnlockTrigger = $false
+
+    if ($null -ne $taskDefinitionXml) {
+        $namespaceManager = [System.Xml.XmlNamespaceManager]::new($taskDefinitionXml.NameTable)
+        [void]$namespaceManager.AddNamespace('task', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+
+        $supportsLogonTrigger = ($null -ne $taskDefinitionXml.SelectSingleNode('/task:Task/task:Triggers/task:LogonTrigger', $namespaceManager))
+        $supportsUnlockTrigger = ($null -ne $taskDefinitionXml.SelectSingleNode('/task:Task/task:Triggers/task:SessionStateChangeTrigger[task:StateChange = "SessionUnlock"]', $namespaceManager))
+    }
+
+    $referenceTime = if ($TaskStartTime -is [datetime]) {
+        $TaskStartTime
+    }
+    elseif ($TaskLaunchTime -is [datetime]) {
+        $TaskLaunchTime
+    }
+    else {
+        $null
+    }
+
+    $recentLogonEvent = $null
+    $logonDetectionWindow = [TimeSpan]::FromSeconds(120)
+
+    if ($supportsLogonTrigger -and $referenceTime -is [datetime]) {
+        try {
+            $recentLogonEvent = @(
+                Get-WinEvent -FilterHashtable @{
+                    LogName      = 'System'
+                    ProviderName = 'Microsoft-Windows-Winlogon'
+                    Id           = 7001
+                    StartTime    = $referenceTime.Subtract($logonDetectionWindow)
+                    EndTime      = $referenceTime.AddSeconds(5)
+                } -ErrorAction Stop |
+                Where-Object { $_.Message -like 'User Log-on Notification*' } |
+                Sort-Object -Property TimeCreated -Descending
+            ) | Select-Object -First 1
+        }
+        catch {
+            $recentLogonEvent = $null
+        }
+    }
+
+    if ($null -ne $recentLogonEvent) {
+        return [pscustomobject]@{
+            TriggerSource = 'Logon'
+            Reason        = "Matched a Winlogon user logon notification at $($recentLogonEvent.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) within $([int]$logonDetectionWindow.TotalSeconds) seconds of task start."
+        }
+    }
+
+    if ($supportsUnlockTrigger -and -not $supportsLogonTrigger) {
+        return [pscustomobject]@{
+            TriggerSource = 'Unlock'
+            Reason        = 'Task definition exposes only a session unlock trigger.'
+        }
+    }
+
+    if ($supportsLogonTrigger -and -not $supportsUnlockTrigger) {
+        return [pscustomobject]@{
+            TriggerSource = 'Logon'
+            Reason        = 'Task definition exposes only a logon trigger.'
+        }
+    }
+
+    if ($supportsUnlockTrigger -and $supportsLogonTrigger) {
+        return [pscustomobject]@{
+            TriggerSource = 'Unlock'
+            Reason        = "Task definition includes both logon and unlock triggers, and no Winlogon user logon notification was found within $([int]$logonDetectionWindow.TotalSeconds) seconds of task start."
+        }
+    }
+
+    return [pscustomobject]@{
+        TriggerSource = 'Unknown'
+        Reason        = 'Task trigger type could not be resolved from the task definition or available event history.'
     }
 }
 
@@ -422,6 +550,8 @@ try {
         $startInfo.EnvironmentVariables['SET_EXTERNAL_MONITOR_TASK_ACTION_NAME'] = [string]$taskContext.TaskActionName
         $startInfo.EnvironmentVariables['SET_EXTERNAL_MONITOR_TASK_START_TIME'] = $taskContext.TaskStartTime.ToString('o')
         $startInfo.EnvironmentVariables['SET_EXTERNAL_MONITOR_TASK_LAUNCH_TIME'] = $taskContext.TaskLaunchTime.ToString('o')
+        $startInfo.EnvironmentVariables['SET_EXTERNAL_MONITOR_TASK_TRIGGER_SOURCE'] = [string]$taskContext.TaskTriggerSource
+        $startInfo.EnvironmentVariables['SET_EXTERNAL_MONITOR_TASK_TRIGGER_REASON'] = [string]$taskContext.TaskTriggerReason
     }
 
     foreach ($argument in @($ScriptArguments)) {
