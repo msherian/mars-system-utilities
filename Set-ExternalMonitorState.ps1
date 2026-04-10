@@ -113,214 +113,420 @@ param(
     [ArgumentCompleter({
             param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
 
-            $scriptPath = $PSCommandPath
-            if ([string]::IsNullOrWhiteSpace($scriptPath) -or -not (Test-Path -LiteralPath $scriptPath)) {
+            # Resolve winddcutil path — use the explicitly bound value, or probe known locations.
+            $ddcUtilPath = if ($fakeBoundParameters.ContainsKey('DdcUtilPath')) {
+                [string]$fakeBoundParameters.DdcUtilPath
+            }
+            else {
+                @(
+                    if (-not [string]::IsNullOrWhiteSpace($env:WINDDCUTIL_HOME)) {
+                        Join-Path -Path $env:WINDDCUTIL_HOME -ChildPath 'bin\winddcutil.exe'
+                    }
+                    Join-Path -Path ${env:ProgramFiles} -ChildPath 'winddcutil\winddcutil.exe'
+                    'c:\programs\winddcutil\winddcutil.exe'
+                ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+            }
+
+            if ([string]::IsNullOrWhiteSpace($ddcUtilPath) -or -not (Test-Path -LiteralPath $ddcUtilPath -PathType Leaf)) {
+                [System.Management.Automation.CompletionResult]::new("''", '(winddcutil not found)', 'ParameterValue', 'Cannot locate winddcutil.exe.')
                 return
             }
 
-            try {
-                $detectedMonitors = @(& $scriptPath -DetectOnly -Json 2>$null | ConvertFrom-Json)
-            }
-            catch {
-                return
-            }
-
-            foreach ($detectedMonitor in $detectedMonitors) {
-                $monitorId = [string]$detectedMonitor.Id
-                $resolvedDescription = [string]$detectedMonitor.ResolvedDescription
-                if ([string]::IsNullOrWhiteSpace($resolvedDescription)) {
-                    $resolvedDescription = [string]$detectedMonitor.Description
+            # Helper: invoke winddcutil with the given arguments; return combined stdout+stderr.
+            $runWinddcutil = {
+                param([string]$Exe, [string[]]$CmdArgs)
+                try {
+                    $si = [System.Diagnostics.ProcessStartInfo]::new()
+                    $si.FileName = $Exe
+                    $si.UseShellExecute = $false
+                    $si.RedirectStandardOutput = $true
+                    $si.RedirectStandardError = $true
+                    $si.CreateNoWindow = $true
+                    foreach ($a in $CmdArgs) { [void]$si.ArgumentList.Add($a) }
+                    $p = [System.Diagnostics.Process]::new()
+                    $p.StartInfo = $si
+                    [void]$p.Start()
+                    $stderrTask = $p.StandardError.ReadToEndAsync()
+                    $out = $p.StandardOutput.ReadToEnd()
+                    $out += $stderrTask.GetAwaiter().GetResult()
+                    $p.WaitForExit()
+                    return $out
                 }
+                catch { return '' }
+            }
 
-                $selectionValue = ('[{0}] {1}' -f $monitorId, $resolvedDescription)
-                $quotedSelectionValue = "'{0}'" -f $selectionValue.Replace("'", "''")
+            # Detect monitors.
+            $detectText = & $runWinddcutil $ddcUtilPath @('detect')
+            $detected = [System.Collections.Generic.List[pscustomobject]]::new()
+            foreach ($line in ($detectText -split "`r?`n")) {
+                if ($line -match '^\s*(?<Id>\d+)\s+(?<Description>.+?)\s*$') {
+                    [void]$detected.Add([pscustomobject]@{
+                            Id                = $Matches.Id
+                            Description       = $Matches.Description.Trim()
+                            CapabilitiesModel = ''
+                        })
+                }
+            }
 
+            # For Generic PnP Monitors: fetch capabilities → extract model() for WMI matching.
+            foreach ($det in @($detected | Where-Object { $_.Description -eq 'Generic PnP Monitor' })) {
+                $capText = (& $runWinddcutil $ddcUtilPath @('capabilities', $det.Id)).Trim()
+                if ($capText -match 'model\((?<Model>[^\)]+)\)') { $det.CapabilitiesModel = $Matches.Model.Trim() }
+            }
+
+            # WMI monitor details.
+            $cimMonitors = [System.Collections.Generic.List[pscustomobject]]::new()
+            try {
+                foreach ($w in @(Get-CimInstance -ClassName WMIMonitorID -Namespace root\wmi -ErrorAction Stop)) {
+                    $fn  = (-join [char[]](@($w.UserFriendlyName | Where-Object { $_ -gt 0 }))).Trim()
+                    $sn  = (-join [char[]](@($w.SerialNumberID   | Where-Object { $_ -gt 0 }))).Trim()
+                    $mfr = (-join [char[]](@($w.ManufacturerName  | Where-Object { $_ -gt 0 }))).Trim()
+                    $inst = [string]$w.InstanceName
+                    $dc  = if (($inst -split '\\').Count -ge 2) { ($inst -split '\\')[1] } else { '' }
+                    [void]$cimMonitors.Add([pscustomobject]@{
+                            UserFriendlyName = $fn; SerialNumber = $sn
+                            Manufacturer     = $mfr; DeviceCode = $dc; Active = [bool]$w.Active
+                        })
+                }
+            }
+            catch { }
+
+            # Score a detected monitor against a WMI entry (mirrors Add-CimMonitorDetails).
+            $scoreCim = {
+                param($det, $cim)
+                $s   = 0
+                $du  = $det.Description.ToUpperInvariant()
+                $dcu = $cim.DeviceCode.ToUpperInvariant()
+                $fnu = $cim.UserFriendlyName.ToUpperInvariant()
+                $mfu = $cim.Manufacturer.ToUpperInvariant()
+                if ($dcu -and $du.Contains($dcu)) { $s += 10 }
+                if ($fnu -and $du.Contains($fnu)) { $s += 5 }
+                if ($cim.Active)                  { $s += 1 }
+                $dt = @([regex]::Replace($du,  '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })
+                foreach ($t in @([regex]::Replace($fnu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($dt -contains $t) { $s += 1 } }
+                foreach ($t in @([regex]::Replace($mfu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($dt -contains $t) { $s += 1 } }
+                if (-not [string]::IsNullOrWhiteSpace($det.CapabilitiesModel)) {
+                    $cmu = $det.CapabilitiesModel.ToUpperInvariant()
+                    if ($fnu -and $cmu.Contains($fnu)) { $s += 8 }
+                    if ($mfu -and $cmu.Contains($mfu)) { $s += 6 }
+                    $cmt = @([regex]::Replace($cmu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })
+                    foreach ($t in @([regex]::Replace($fnu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($cmt -contains $t) { $s += 2 } }
+                    foreach ($t in @([regex]::Replace($mfu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($cmt -contains $t) { $s += 2 } }
+                }
+                $s
+            }
+
+            # Assign WMI entries to detected monitors (specific monitors first, generics after).
+            $cimAssignments = @{}
+            $availableCim = [System.Collections.Generic.List[pscustomobject]]::new($cimMonitors)
+            foreach ($pass in @('specific', 'generic')) {
+                foreach ($det in @($detected | Where-Object { ($_.Description -eq 'Generic PnP Monitor') -eq ($pass -eq 'generic') })) {
+                    if ($cimAssignments.ContainsKey($det.Id)) { continue }
+                    $best = $null; $bestScore = 0
+                    foreach ($cim in @($availableCim)) {
+                        $s = & $scoreCim $det $cim
+                        if ($s -gt $bestScore) { $bestScore = $s; $best = $cim }
+                    }
+                    if ($null -ne $best -and $bestScore -gt 1) {
+                        $cimAssignments[$det.Id] = $best
+                        [void]$availableCim.Remove($best)
+                    }
+                }
+            }
+
+            # Build enriched list with resolved descriptions.
+            $enriched = @(
+                $detected | ForEach-Object {
+                    $cim  = $cimAssignments[$_.Id]
+                    $desc = $_.Description
+                    if ($desc -eq 'Generic PnP Monitor') {
+                        if ($null -ne $cim -and -not [string]::IsNullOrWhiteSpace($cim.UserFriendlyName)) {
+                            $desc = $cim.UserFriendlyName
+                        }
+                        elseif (-not [string]::IsNullOrWhiteSpace($_.CapabilitiesModel)) {
+                            $desc = $_.CapabilitiesModel
+                        }
+                    }
+                    [pscustomobject]@{
+                        Id          = $_.Id
+                        Description = $desc
+                        SerialNumber = if ($null -ne $cim) { $cim.SerialNumber } else { '' }
+                    }
+                }
+            )
+
+            if ($enriched.Count -eq 0) {
+                [System.Management.Automation.CompletionResult]::new("''", '(No monitors detected)', 'ParameterValue', 'winddcutil detect returned no monitors.')
+                return
+            }
+
+            foreach ($m in $enriched) {
+                $selectionValue = '[{0}] {1}' -f $m.Id, $m.Description
+                $quotedValue    = "'{0}'" -f $selectionValue.Replace("'", "''")
+                $tooltip = if (-not [string]::IsNullOrWhiteSpace($m.SerialNumber)) {
+                    'Id {0}: {1} (S/N {2})' -f $m.Id, $m.Description, $m.SerialNumber
+                }
+                else { 'Id {0}: {1}' -f $m.Id, $m.Description }
                 $matchesWord = [string]::IsNullOrWhiteSpace($wordToComplete) -or
-                $selectionValue -like "*$wordToComplete*" -or
-                $quotedSelectionValue -like "*$wordToComplete*" -or
-                $resolvedDescription -like "*$wordToComplete*"
-
+                    $selectionValue -like "*$wordToComplete*" -or
+                    $quotedValue -like "*$wordToComplete*" -or
+                    $m.Description -like "*$wordToComplete*"
                 if ($matchesWord) {
-                    [System.Management.Automation.CompletionResult]::new(
-                        $quotedSelectionValue,
-                        $selectionValue,
-                        'ParameterValue',
-                        ('Id {0}: {1}' -f $monitorId, $resolvedDescription)
-                    )
+                    [System.Management.Automation.CompletionResult]::new($quotedValue, $selectionValue, 'ParameterValue', $tooltip)
                 }
             }
         })]
     [string[]]$Monitors,
-    [string]$DdcUtilPath,
+    [ValidateSet('On', 'Off', 'Sleep')]
+    [string]$PowerAction = 'On',
+    [ArgumentCompleter({
+            param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
+
+            # Same map as $InputSourceValueMap in end{} — friendly name → VCP code.
+            $InputSourceValueMap = @{
+                'DisplayPort-1' = '0x0F'
+                'DisplayPort-2' = '0x10'
+                'HDMI1'         = '0x11'
+                'HDMI2'         = '0x12'
+            }
+            # Derive VCP hex → name lookup for capabilities parsing.
+            $vcpToName = @{}
+            foreach ($kv in $InputSourceValueMap.GetEnumerator()) {
+                $hex = ($kv.Value -replace '^0[xX]', '').ToUpperInvariant().PadLeft(2, '0')
+                $vcpToName[$hex] = $kv.Key
+            }
+
+            # Default when winddcutil is unavailable or no monitors are selected.
+            $availableInputSources = @($InputSourceValueMap.Keys)
+
+            # Resolve winddcutil path — use the explicitly bound value, or probe known locations.
+            $ddcUtilPath = if ($fakeBoundParameters.ContainsKey('DdcUtilPath')) {
+                [string]$fakeBoundParameters.DdcUtilPath
+            }
+            else {
+                @(
+                    if (-not [string]::IsNullOrWhiteSpace($env:WINDDCUTIL_HOME)) {
+                        Join-Path -Path $env:WINDDCUTIL_HOME -ChildPath 'bin\winddcutil.exe'
+                    }
+                    Join-Path -Path ${env:ProgramFiles} -ChildPath 'winddcutil\winddcutil.exe'
+                    'c:\programs\winddcutil\winddcutil.exe'
+                ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($ddcUtilPath) -and (Test-Path -LiteralPath $ddcUtilPath -PathType Leaf)) {
+
+                # Helper: invoke winddcutil with the given arguments; return combined stdout+stderr.
+                $runWinddcutil = {
+                    param([string]$Exe, [string[]]$CmdArgs)
+                    try {
+                        $si = [System.Diagnostics.ProcessStartInfo]::new()
+                        $si.FileName = $Exe
+                        $si.UseShellExecute = $false
+                        $si.RedirectStandardOutput = $true
+                        $si.RedirectStandardError = $true
+                        $si.CreateNoWindow = $true
+                        foreach ($a in $CmdArgs) { [void]$si.ArgumentList.Add($a) }
+                        $p = [System.Diagnostics.Process]::new()
+                        $p.StartInfo = $si
+                        [void]$p.Start()
+                        $stderrTask = $p.StandardError.ReadToEndAsync()
+                        $out = $p.StandardOutput.ReadToEnd()
+                        $out += $stderrTask.GetAwaiter().GetResult()
+                        $p.WaitForExit()
+                        return $out
+                    }
+                    catch { return '' }
+                }
+
+                # Detect monitors.
+                $detectText = & $runWinddcutil $ddcUtilPath @('detect')
+                $detected = [System.Collections.Generic.List[pscustomobject]]::new()
+                foreach ($line in ($detectText -split "`r?`n")) {
+                    if ($line -match '^\s*(?<Id>\d+)\s+(?<Description>.+?)\s*$') {
+                        [void]$detected.Add([pscustomobject]@{
+                                Id                = $Matches.Id
+                                Description       = $Matches.Description.Trim()
+                                CapabilitiesModel = ''
+                            })
+                    }
+                }
+
+                # For Generic PnP Monitors: fetch capabilities → extract model() for WMI matching.
+                foreach ($det in @($detected | Where-Object { $_.Description -eq 'Generic PnP Monitor' })) {
+                    $capText = (& $runWinddcutil $ddcUtilPath @('capabilities', $det.Id)).Trim()
+                    if ($capText -match 'model\((?<Model>[^\)]+)\)') { $det.CapabilitiesModel = $Matches.Model.Trim() }
+                }
+
+                # WMI monitor details.
+                $cimMonitors = [System.Collections.Generic.List[pscustomobject]]::new()
+                try {
+                    foreach ($w in @(Get-CimInstance -ClassName WMIMonitorID -Namespace root\wmi -ErrorAction Stop)) {
+                        $fn  = (-join [char[]](@($w.UserFriendlyName | Where-Object { $_ -gt 0 }))).Trim()
+                        $mfr = (-join [char[]](@($w.ManufacturerName  | Where-Object { $_ -gt 0 }))).Trim()
+                        $inst = [string]$w.InstanceName
+                        $dc  = if (($inst -split '\\').Count -ge 2) { ($inst -split '\\')[1] } else { '' }
+                        [void]$cimMonitors.Add([pscustomobject]@{
+                                UserFriendlyName = $fn; Manufacturer = $mfr
+                                DeviceCode = $dc; Active = [bool]$w.Active
+                            })
+                    }
+                }
+                catch { }
+
+                # Score a detected monitor against a WMI entry (mirrors Add-CimMonitorDetails).
+                $scoreCim = {
+                    param($det, $cim)
+                    $s   = 0
+                    $du  = $det.Description.ToUpperInvariant()
+                    $dcu = $cim.DeviceCode.ToUpperInvariant()
+                    $fnu = $cim.UserFriendlyName.ToUpperInvariant()
+                    $mfu = $cim.Manufacturer.ToUpperInvariant()
+                    if ($dcu -and $du.Contains($dcu)) { $s += 10 }
+                    if ($fnu -and $du.Contains($fnu)) { $s += 5 }
+                    if ($cim.Active)                  { $s += 1 }
+                    $dt = @([regex]::Replace($du,  '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })
+                    foreach ($t in @([regex]::Replace($fnu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($dt -contains $t) { $s += 1 } }
+                    foreach ($t in @([regex]::Replace($mfu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($dt -contains $t) { $s += 1 } }
+                    if (-not [string]::IsNullOrWhiteSpace($det.CapabilitiesModel)) {
+                        $cmu = $det.CapabilitiesModel.ToUpperInvariant()
+                        if ($fnu -and $cmu.Contains($fnu)) { $s += 8 }
+                        if ($mfu -and $cmu.Contains($mfu)) { $s += 6 }
+                        $cmt = @([regex]::Replace($cmu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })
+                        foreach ($t in @([regex]::Replace($fnu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($cmt -contains $t) { $s += 2 } }
+                        foreach ($t in @([regex]::Replace($mfu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($cmt -contains $t) { $s += 2 } }
+                    }
+                    $s
+                }
+
+                # Assign WMI entries to detected monitors (specific monitors first, generics after).
+                $cimAssignments = @{}
+                $availableCim = [System.Collections.Generic.List[pscustomobject]]::new($cimMonitors)
+                foreach ($pass in @('specific', 'generic')) {
+                    foreach ($det in @($detected | Where-Object { ($_.Description -eq 'Generic PnP Monitor') -eq ($pass -eq 'generic') })) {
+                        if ($cimAssignments.ContainsKey($det.Id)) { continue }
+                        $best = $null; $bestScore = 0
+                        foreach ($cim in @($availableCim)) {
+                            $s = & $scoreCim $det $cim
+                            if ($s -gt $bestScore) { $bestScore = $s; $best = $cim }
+                        }
+                        if ($null -ne $best -and $bestScore -gt 1) {
+                            $cimAssignments[$det.Id] = $best
+                            [void]$availableCim.Remove($best)
+                        }
+                    }
+                }
+
+                # Build enriched list with resolved descriptions.
+                $enriched = @(
+                    $detected | ForEach-Object {
+                        $cim  = $cimAssignments[$_.Id]
+                        $desc = $_.Description
+                        if ($desc -eq 'Generic PnP Monitor') {
+                            if ($null -ne $cim -and -not [string]::IsNullOrWhiteSpace($cim.UserFriendlyName)) {
+                                $desc = $cim.UserFriendlyName
+                            }
+                            elseif (-not [string]::IsNullOrWhiteSpace($_.CapabilitiesModel)) {
+                                $desc = $_.CapabilitiesModel
+                            }
+                        }
+                        [pscustomobject]@{ Id = $_.Id; Description = $desc }
+                    }
+                )
+
+                if ($fakeBoundParameters.ContainsKey('Monitors')) {
+                    # Parse selected monitor selections into (Id, Label) pairs.
+                    $selectedMonitors = [System.Collections.Generic.List[pscustomobject]]::new()
+                    foreach ($rawSel in @($fakeBoundParameters.Monitors)) {
+                        foreach ($part in @([regex]::Split([string]$rawSel, '\s*,\s*(?=\[\d+\]\s+)'))) {
+                            if ($part -match '^\[(?<Id>\d+)\]\s+(?<Label>.+?)\s*$') {
+                                [void]$selectedMonitors.Add([pscustomobject]@{ Id = [string]$Matches.Id; Label = $Matches.Label.Trim() })
+                            }
+                        }
+                    }
+
+                    if ($selectedMonitors.Count -gt 0) {
+                        # Token-score enriched descriptions against the last selected label to resolve
+                        # the current Id — handles winddcutil detect Id instability across completions.
+                        $lastMon     = $selectedMonitors[$selectedMonitors.Count - 1]
+                        $labelUp     = $lastMon.Label.ToUpperInvariant()
+                        $labelTokens = @([regex]::Replace($labelUp, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })
+                        $resolvedId  = $lastMon.Id   # fallback: stored Id
+                        $bestTotal   = 0
+                        foreach ($e in $enriched) {
+                            $edUp   = $e.Description.ToUpperInvariant()
+                            $edToks = @([regex]::Replace($edUp, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })
+                            $ts     = @($labelTokens | Where-Object { $edToks -contains $_ }).Count
+                            $ib     = if ($e.Id -eq $lastMon.Id) { 1 } else { 0 }
+                            $tot    = $ts * 2 + $ib
+                            if ($ts -gt 0 -and $tot -gt $bestTotal) { $bestTotal = $tot; $resolvedId = $e.Id }
+                        }
+
+                        # Get VCP 60 input sources for the resolved monitor.
+                        $capText = (& $runWinddcutil $ddcUtilPath @('capabilities', $resolvedId)).Trim()
+                        $availableInputSources = @()
+                        if ($capText -match '60\((?<Values>[^\)]+)\)') {
+                            $availableInputSources = @(
+                                foreach ($v in @($Matches.Values -split '\s+')) {
+                                    $nv = $v.Trim().ToUpperInvariant().PadLeft(2, '0')
+                                    if ($vcpToName.ContainsKey($nv)) { $vcpToName[$nv] }
+                                }
+                            ) | Select-Object -Unique
+                        }
+
+                        if ($availableInputSources.Count -eq 0) {
+                            foreach ($mon in $selectedMonitors) {
+                                $lbl = '[{0}] {1}' -f $mon.Id, $mon.Label
+                                [System.Management.Automation.CompletionResult]::new(
+                                    ("'<No input source: {0}>'" -f $lbl),
+                                    ("Warning: input cannot be selected for '{0}'" -f $lbl),
+                                    'ParameterValue',
+                                    ("'{0}' does not support input source switching via DDC/CI." -f $lbl)
+                                )
+                            }
+                            return
+                        }
+                    }
+                }
+            }
+
+            foreach ($name in $availableInputSources) {
+                if ([string]::IsNullOrWhiteSpace($wordToComplete) -or $name -like "$wordToComplete*") {
+                    [System.Management.Automation.CompletionResult]::new($name, $name, 'ParameterValue', $name)
+                }
+            }
+        })]
+    [string[]]$InputSource = @('DisplayPort-1'),
+    [Parameter(ParameterSetName = 'DetectOnly')]
+    [switch]$DetectOnly,
+    [Parameter(ParameterSetName = 'DetectOnly')]
+    [switch]$Json,
+    [string]$DdcUtilPath = 'c:\programs\winddcutil\winddcutil.exe',
+    [int]$PostPowerOnDelaySeconds = 5,
     [string]$LogDirectory = 'C:\Windows\Logs\Set-ExternalMonitorState',
     [string]$LogFileName = 'Set-ExternalMonitorState.log',
     [int]$DetectRetryCount = 12,
     [int]$DetectRetryDelaySeconds = 10,
     [int]$SetVcpRetryCount = 3,
     [int]$SetVcpRetryDelaySeconds = 5,
-    [int]$PostPowerOnDelaySeconds = 5,
     [string]$PowerModeCode = 'D6',
-    [ValidateSet('On', 'Off', 'Sleep')]
-    [string]$PowerAction = 'On',
-    [string]$InputSourceCode = '0x60',
-    [ArgumentCompleter({
-            param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
-
-            $scriptPath = $PSCommandPath
-            if ([string]::IsNullOrWhiteSpace($scriptPath) -or -not (Test-Path -LiteralPath $scriptPath)) {
-                return
-            }
-
-            $ddcUtilPath = if ($fakeBoundParameters.ContainsKey('DdcUtilPath')) {
-                [string]$fakeBoundParameters.DdcUtilPath
-            }
-            else {
-                $managedInstallPaths = @(
-                    Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Programs\winddcutil'
-                    Join-Path -Path ${env:ProgramFiles} -ChildPath 'winddcutil'
-                )
-
-                @(
-                    foreach ($managedInstallRoot in $managedInstallPaths) {
-                        if (-not (Test-Path -LiteralPath $managedInstallRoot -PathType Container)) {
-                            continue
-                        }
-
-                        Get-ChildItem -LiteralPath $managedInstallRoot -Directory -ErrorAction SilentlyContinue |
-                        ForEach-Object {
-                            $candidatePath = Join-Path -Path $_.FullName -ChildPath 'bin\winddcutil.exe'
-                            if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
-                                return
-                            }
-
-                            $version = $null
-                            if ([version]::TryParse($_.Name.TrimStart('v', 'V'), [ref]$version)) {
-                                [pscustomobject]@{
-                                    Version = $version
-                                    Path    = $candidatePath
-                                }
-                            }
-                        }
-                    }
-                ) |
-                Sort-Object -Property Version -Descending |
-                Select-Object -First 1 -ExpandProperty Path
-            }
-
-            if ([string]::IsNullOrWhiteSpace($ddcUtilPath) -or -not (Test-Path -LiteralPath $ddcUtilPath -PathType Leaf)) {
-                return
-            }
-
-            $inputSourceNameMap = @{
-                '0F' = 'DisplayPort'
-                '11' = 'HDMI1'
-                '12' = 'HDMI2'
-            }
-
-            $selectedMonitorIds = [System.Collections.Generic.List[string]]::new()
-            if ($fakeBoundParameters.ContainsKey('Monitors')) {
-                foreach ($rawSelection in @($fakeBoundParameters.Monitors)) {
-                    foreach ($part in @([regex]::Split([string]$rawSelection, '\s*,\s*(?=\[\d+\]\s+)'))) {
-                        if ($part -match '^\[(?<Id>\d+)\]\s+') {
-                            [void]$selectedMonitorIds.Add([string]$Matches.Id)
-                        }
-                    }
-                }
-            }
-
-            $availableInputSources = $null
-            if ($selectedMonitorIds.Count -gt 0) {
-                foreach ($monitorId in @($selectedMonitorIds | Select-Object -Unique)) {
-                    try {
-                        $capabilitiesText = (& $ddcUtilPath capabilities $monitorId 2>$null | Out-String).Trim()
-                    }
-                    catch {
-                        continue
-                    }
-
-                    if (-not ($capabilitiesText -match '60\((?<Values>[^\)]+)\)')) {
-                        continue
-                    }
-
-                    $supportedForMonitor = @(
-                        foreach ($value in @($Matches.Values -split '\s+')) {
-                            $normalizedValue = $value.Trim().ToUpperInvariant()
-                            if ($inputSourceNameMap.ContainsKey($normalizedValue)) {
-                                $inputSourceNameMap[$normalizedValue]
-                            }
-                        }
-                    ) | Select-Object -Unique
-
-                    if ($null -eq $availableInputSources) {
-                        $availableInputSources = @($supportedForMonitor)
-                    }
-                    else {
-                        $availableInputSources = @($availableInputSources | Where-Object { $supportedForMonitor -contains $_ })
-                    }
-                }
-            }
-
-            if ($null -eq $availableInputSources -or $availableInputSources.Count -eq 0) {
-                $availableInputSources = @('DisplayPort', 'HDMI1', 'HDMI2')
-            }
-
-            foreach ($inputSourceName in $availableInputSources) {
-                if ([string]::IsNullOrWhiteSpace($wordToComplete) -or $inputSourceName -like "$wordToComplete*") {
-                    [System.Management.Automation.CompletionResult]::new(
-                        $inputSourceName,
-                        $inputSourceName,
-                        'ParameterValue',
-                        $inputSourceName
-                    )
-                }
-            }
-        })]
-    [string[]]$InputSource = @('DisplayPort'),
-    [Parameter(ParameterSetName = 'DetectOnly')]
-    [switch]$DetectOnly,
-    [Parameter(ParameterSetName = 'DetectOnly')]
-    [switch]$Json
+    [string]$InputSourceCode = '0x60'
 )
 
 begin {
+    # Stored at script scope so functions inside end{} can use it without a subprocess call.
+    $script:DefaultMonitorSerialNumbers = $null
     if (-not $DetectOnly -and -not $PSBoundParameters.ContainsKey('Monitors')) {
-        $defaultMonitorSerialNumbers = @(
+        $script:DefaultMonitorSerialNumbers = @(
             'UKC2035000146'
             'UKC2035000138'
         )
-
-        $scriptPath = $PSCommandPath
-        if (-not [string]::IsNullOrWhiteSpace($scriptPath) -and (Test-Path -LiteralPath $scriptPath)) {
-            try {
-                $detectedDefaultMonitors = @(& $scriptPath -DetectOnly -Json 2>$null | ConvertFrom-Json)
-            }
-            catch {
-                $detectedDefaultMonitors = @()
-            }
-
-            $matchedDefaultMonitors = @(
-                $detectedDefaultMonitors |
-                Where-Object { $defaultMonitorSerialNumbers -contains ([string]$_.SerialNumber) } |
-                Sort-Object -Property @{ Expression = { [array]::IndexOf($defaultMonitorSerialNumbers, [string]$_.SerialNumber) }; Descending = $false }
-            )
-
-            if ($matchedDefaultMonitors.Count -gt 0) {
-                $Monitors = @(
-                    foreach ($matchedDefaultMonitor in $matchedDefaultMonitors) {
-                        $resolvedDescription = [string]$matchedDefaultMonitor.ResolvedDescription
-                        if ([string]::IsNullOrWhiteSpace($resolvedDescription)) {
-                            $resolvedDescription = [string]$matchedDefaultMonitor.Description
-                        }
-
-                        '[{0}] {1}' -f ([string]$matchedDefaultMonitor.Id), $resolvedDescription
-                    }
-                )
-            }
-        }
     }
 }
 
 end {
+
+    # Initialize cached path before Set-StrictMode so referencing it unset doesn't throw.
+    $script:ResolvedDdcUtilCommandPath = $null
 
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
@@ -332,9 +538,10 @@ end {
     $MaxLogAge = [TimeSpan]::FromDays(14)
     $TaskSchedulerHistoryLogName = 'Microsoft-Windows-TaskScheduler/Operational'
     $InputSourceValueMap = @{
-        DisplayPort = '0x0F'
-        HDMI1       = '0x11'
-        HDMI2       = '0x12'
+        'DisplayPort-1'  = '0x0F'
+        'DisplayPort-2'  = '0x10'
+        'HDMI1'          = '0x11'
+        'HDMI2'          = '0x12'
     }
     $PowerActionValueMap = @{
         On    = '1'
@@ -391,6 +598,8 @@ Writes an informational log entry.
 
         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
         $entry = "[$timestamp] [$Level] $Message"
+
+        Write-Host $entry
 
         try {
             Add-Content -Path $LogPath -Value $entry -ErrorAction Stop
@@ -655,7 +864,7 @@ Writes an informational log entry.
 
         try {
             $release = Invoke-RestMethod -Uri $releaseUri -Headers @{
-                'Accept' = 'application/vnd.github+json'
+                'Accept'     = 'application/vnd.github+json'
                 'User-Agent' = 'Set-ExternalMonitorState'
             } -ErrorAction Stop
         }
@@ -672,11 +881,11 @@ Writes an informational log entry.
         $installScope = Get-WinddcutilInstallScope
 
         return [pscustomobject]@{
-            Version     = $normalizedVersion
-            DownloadUrl = [string]$asset.browser_download_url
+            Version      = $normalizedVersion
+            DownloadUrl  = [string]$asset.browser_download_url
             InstallScope = $installScope
-            InstallHome = Get-WinddcutilHomeForVersion -Version $normalizedVersion -Scope $installScope
-            InstallPath = Get-WinddcutilInstallPathForVersion -Version $normalizedVersion -Scope $installScope
+            InstallHome  = Get-WinddcutilHomeForVersion -Version $normalizedVersion -Scope $installScope
+            InstallPath  = Get-WinddcutilInstallPathForVersion -Version $normalizedVersion -Scope $installScope
         }
     }
 
@@ -787,6 +996,20 @@ Writes an informational log entry.
 
         if (-not [string]::IsNullOrWhiteSpace($RequestedPath) -and (Test-Path -LiteralPath $RequestedPath -PathType Leaf)) {
             return (Get-Item -LiteralPath $RequestedPath -ErrorAction Stop).FullName
+        }
+
+        # Check WINDDCUTIL_HOME set by Install-Winddcutil / Update-WinddcutilEnvironment.
+        if (-not [string]::IsNullOrWhiteSpace($env:WINDDCUTIL_HOME)) {
+            $homeExe = Join-Path -Path $env:WINDDCUTIL_HOME -ChildPath 'bin\winddcutil.exe'
+            if (Test-Path -LiteralPath $homeExe -PathType Leaf) {
+                return (Get-Item -LiteralPath $homeExe -ErrorAction Stop).FullName
+            }
+        }
+
+        # Check direct (non-versioned) install in ProgramFiles.
+        $programFilesExe = Join-Path -Path ${env:ProgramFiles} -ChildPath 'winddcutil\winddcutil.exe'
+        if (Test-Path -LiteralPath $programFilesExe -PathType Leaf) {
+            return (Get-Item -LiteralPath $programFilesExe -ErrorAction Stop).FullName
         }
 
         $installedPath = Get-InstalledWinddcutilPath
@@ -1007,16 +1230,16 @@ Writes an informational log entry.
         }
 
         return [pscustomobject]@{
-            Mode                     = 'ScheduledTask'
-            Reason                   = 'Matched Task Scheduler launch history to the current process ancestry.'
-            ProcessChain             = $processChain
-            TaskName                 = $taskName
-            TaskInstanceId           = $taskInstanceId
-            TaskActionName           = if ($null -ne $actionStartEvent) { [string]$actionStartEvent.EventData.ActionName } else { $null }
-            TaskLaunchTime           = [datetime]$selectedLaunch.Event.TimeCreated
-            TaskStartTime            = if ($null -ne $startEvent) { [datetime]$startEvent.Event.TimeCreated } else { [datetime]$selectedLaunch.Event.TimeCreated }
-            MatchedProcessId         = [int]$selectedLaunch.MatchedProcess.ProcessId
-            MatchedProcessName       = [string]$selectedLaunch.MatchedProcess.Name
+            Mode                      = 'ScheduledTask'
+            Reason                    = 'Matched Task Scheduler launch history to the current process ancestry.'
+            ProcessChain              = $processChain
+            TaskName                  = $taskName
+            TaskInstanceId            = $taskInstanceId
+            TaskActionName            = if ($null -ne $actionStartEvent) { [string]$actionStartEvent.EventData.ActionName } else { $null }
+            TaskLaunchTime            = [datetime]$selectedLaunch.Event.TimeCreated
+            TaskStartTime             = if ($null -ne $startEvent) { [datetime]$startEvent.Event.TimeCreated } else { [datetime]$selectedLaunch.Event.TimeCreated }
+            MatchedProcessId          = [int]$selectedLaunch.MatchedProcess.ProcessId
+            MatchedProcessName        = [string]$selectedLaunch.MatchedProcess.Name
             MatchedProcessCommandLine = [string]$selectedLaunch.MatchedProcess.CommandLine
         }
     }
@@ -1149,15 +1372,19 @@ Sets the input source for display 3 to the specified VCP value.
             [switch]$IgnoreExitCode
         )
 
-        if ([string]::IsNullOrWhiteSpace($DdcUtilPath)) {
-            throw 'DdcUtilPath is null or empty.'
+        if (-not $script:ResolvedDdcUtilCommandPath) {
+            if ([string]::IsNullOrWhiteSpace($DdcUtilPath)) {
+                throw 'DdcUtilPath is null or empty.'
+            }
+
+            if (-not (Test-Path -LiteralPath $DdcUtilPath -PathType Leaf)) {
+                throw "winddcutil not found at '$DdcUtilPath'."
+            }
+
+            $script:ResolvedDdcUtilCommandPath = (Get-Item -LiteralPath $DdcUtilPath -ErrorAction Stop).FullName
         }
 
-        if (-not (Test-Path -LiteralPath $DdcUtilPath -PathType Leaf)) {
-            throw "winddcutil not found at '$DdcUtilPath'."
-        }
-
-        $commandPath = (Get-Item -LiteralPath $DdcUtilPath -ErrorAction Stop).FullName
+        $commandPath = $script:ResolvedDdcUtilCommandPath
         $commandName = switch ($PSCmdlet.ParameterSetName) {
             'detect' { 'detect' }
             'capabilities' { 'capabilities' }
@@ -1272,7 +1499,7 @@ Sets the input source for display 3 to the specified VCP value.
             }
         }
 
-        return ($result | ConvertTo-Json -Depth 6 | ConvertFrom-Json)
+        return [pscustomobject]$result
     }
 
     <#
@@ -1300,11 +1527,15 @@ Returns all detected monitors as objects.
             [switch]$IgnoreExitCode
         )
 
-        if (-not (Test-Path -LiteralPath $DdcUtilPath -PathType Leaf)) {
-            throw "winddcutil not found at '$DdcUtilPath'."
+        if (-not $script:ResolvedDdcUtilCommandPath) {
+            if (-not (Test-Path -LiteralPath $DdcUtilPath -PathType Leaf)) {
+                throw "winddcutil not found at '$DdcUtilPath'."
+            }
+
+            $script:ResolvedDdcUtilCommandPath = (Get-Item -LiteralPath $DdcUtilPath -ErrorAction Stop).FullName
         }
 
-        $commandPath = (Get-Item -LiteralPath $DdcUtilPath -ErrorAction Stop).FullName
+        $commandPath = $script:ResolvedDdcUtilCommandPath
 
         try {
             $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -1371,11 +1602,11 @@ monitor properties normalized from the underlying character arrays.
 PSCustomObject[]
 
 .EXAMPLE
-Get-WmiMonitorDetails
+Get-CimMonitorDetails
 
 Returns monitor details reported by WMIMonitorID.
 #>
-    function Get-WmiMonitorDetails {
+    function Get-CimMonitorDetails {
         [CmdletBinding()]
         param()
 
@@ -1472,7 +1703,7 @@ Returns monitor details reported by WMIMonitorID.
                 return [pscustomobject]@{
                     Code         = '0x0F'
                     IsKnown      = $true
-                    LegacyName   = 'DisplayPort'
+                    LegacyName   = 'DisplayPort-1'
                     FriendlyName = 'DisplayPort-1'
                 }
             }
@@ -1480,7 +1711,7 @@ Returns monitor details reported by WMIMonitorID.
                 return [pscustomobject]@{
                     Code         = '0x10'
                     IsKnown      = $true
-                    LegacyName   = $null
+                    LegacyName   = 'DisplayPort-2'
                     FriendlyName = 'DisplayPort-2'
                 }
             }
@@ -1488,7 +1719,7 @@ Returns monitor details reported by WMIMonitorID.
                 return [pscustomobject]@{
                     Code         = '0x11'
                     IsKnown      = $true
-                    LegacyName   = 'HDMI1'
+                    LegacyName   = 'HDMI-1'
                     FriendlyName = 'HDMI-1'
                 }
             }
@@ -1496,7 +1727,7 @@ Returns monitor details reported by WMIMonitorID.
                 return [pscustomobject]@{
                     Code         = '0x12'
                     IsKnown      = $true
-                    LegacyName   = 'HDMI2'
+                    LegacyName   = 'HDM-2'
                     FriendlyName = 'HDMI-2'
                 }
             }
@@ -1614,20 +1845,20 @@ used to resolve generic monitor descriptions.
 .PARAMETER Monitors
 Detected monitor objects to enrich.
 
-.PARAMETER WmiMonitorDetails
-Monitor details returned by Get-WmiMonitorDetails.
+.PARAMETER CimMonitorDetails
+Monitor details returned by Get-CimMonitorDetails.
 
 .OUTPUTS
 PSCustomObject[]
 #>
-    function Add-WmiMonitorDetails {
+    function Add-CimMonitorDetails {
         [CmdletBinding()]
         param(
             [Parameter(Mandatory)]
             [object[]]$Monitors,
 
             [Parameter(Mandatory)]
-            [object[]]$WmiMonitorDetails
+            [object[]]$CimMonitorDetails
         )
 
         function Get-MonitorMatchScore {
@@ -1636,40 +1867,40 @@ PSCustomObject[]
                 [pscustomobject]$Monitor,
 
                 [Parameter(Mandatory)]
-                [pscustomobject]$WmiMonitor
+                [pscustomobject]$CimMonitor
             )
 
             $description = [string]$Monitor.Description
             $descriptionTokens = @(Get-MonitorMatchTokens -Values @($description, $Monitor.CapabilitiesModel))
-            $candidateTokens = @(Get-MonitorMatchTokens -Values @($WmiMonitor.UserFriendlyName, $WmiMonitor.Manufacturer, $WmiMonitor.DeviceCode))
+            $candidateTokens = @(Get-MonitorMatchTokens -Values @($CimMonitor.UserFriendlyName, $CimMonitor.Manufacturer, $CimMonitor.DeviceCode))
             $sharedTokens = @($candidateTokens | Where-Object { $descriptionTokens -contains $_ })
             $score = $sharedTokens.Count
 
-            if (-not [string]::IsNullOrWhiteSpace($WmiMonitor.DeviceCode) -and $description.ToUpperInvariant().Contains($WmiMonitor.DeviceCode.ToUpperInvariant())) {
+            if (-not [string]::IsNullOrWhiteSpace($CimMonitor.DeviceCode) -and $description.ToUpperInvariant().Contains($CimMonitor.DeviceCode.ToUpperInvariant())) {
                 $score += 10
             }
 
-            if (-not [string]::IsNullOrWhiteSpace($WmiMonitor.UserFriendlyName) -and $description.ToUpperInvariant().Contains($WmiMonitor.UserFriendlyName.ToUpperInvariant())) {
+            if (-not [string]::IsNullOrWhiteSpace($CimMonitor.UserFriendlyName) -and $description.ToUpperInvariant().Contains($CimMonitor.UserFriendlyName.ToUpperInvariant())) {
                 $score += 5
             }
 
             if (
                 -not [string]::IsNullOrWhiteSpace([string]$Monitor.CapabilitiesModel) -and
-                -not [string]::IsNullOrWhiteSpace([string]$WmiMonitor.UserFriendlyName) -and
-                $Monitor.CapabilitiesModel.ToUpperInvariant().Contains($WmiMonitor.UserFriendlyName.ToUpperInvariant())
+                -not [string]::IsNullOrWhiteSpace([string]$CimMonitor.UserFriendlyName) -and
+                $Monitor.CapabilitiesModel.ToUpperInvariant().Contains($CimMonitor.UserFriendlyName.ToUpperInvariant())
             ) {
                 $score += 8
             }
 
             if (
                 -not [string]::IsNullOrWhiteSpace([string]$Monitor.CapabilitiesModel) -and
-                -not [string]::IsNullOrWhiteSpace([string]$WmiMonitor.Manufacturer) -and
-                $Monitor.CapabilitiesModel.ToUpperInvariant().Contains($WmiMonitor.Manufacturer.ToUpperInvariant())
+                -not [string]::IsNullOrWhiteSpace([string]$CimMonitor.Manufacturer) -and
+                $Monitor.CapabilitiesModel.ToUpperInvariant().Contains($CimMonitor.Manufacturer.ToUpperInvariant())
             ) {
                 $score += 6
             }
 
-            if ($WmiMonitor.Active) {
+            if ($CimMonitor.Active) {
                 $score += 1
             }
 
@@ -1681,16 +1912,16 @@ PSCustomObject[]
                 [Parameter(Mandatory)]
                 [pscustomobject]$Monitor,
 
-                [pscustomobject]$WmiMonitor
+                [pscustomobject]$CimMonitor
             )
 
             $resolvedDescription = [string]$Monitor.Description
             if (
-                $null -ne $WmiMonitor -and
+                $null -ne $CimMonitor -and
                 $resolvedDescription -eq 'Generic PnP Monitor' -and
-                -not [string]::IsNullOrWhiteSpace([string]$WmiMonitor.UserFriendlyName)
+                -not [string]::IsNullOrWhiteSpace([string]$CimMonitor.UserFriendlyName)
             ) {
-                $resolvedDescription = [string]$WmiMonitor.UserFriendlyName
+                $resolvedDescription = [string]$CimMonitor.UserFriendlyName
             }
             elseif (
                 $resolvedDescription -eq 'Generic PnP Monitor' -and
@@ -1713,22 +1944,22 @@ PSCustomObject[]
                 YearOfManufacture   = $null
             }
 
-            if ($null -ne $WmiMonitor) {
-                $result.ComputerName = $WmiMonitor.ComputerName
-                $result.Active = $WmiMonitor.Active
-                $result.Manufacturer = $WmiMonitor.Manufacturer
-                $result.UserFriendlyName = $WmiMonitor.UserFriendlyName
-                $result.SerialNumber = $WmiMonitor.SerialNumber
-                $result.WeekOfManufacture = $WmiMonitor.WeekOfManufacture
-                $result.YearOfManufacture = $WmiMonitor.YearOfManufacture
+            if ($null -ne $CimMonitor) {
+                $result.ComputerName = $CimMonitor.ComputerName
+                $result.Active = $CimMonitor.Active
+                $result.Manufacturer = $CimMonitor.Manufacturer
+                $result.UserFriendlyName = $CimMonitor.UserFriendlyName
+                $result.SerialNumber = $CimMonitor.SerialNumber
+                $result.WeekOfManufacture = $CimMonitor.WeekOfManufacture
+                $result.YearOfManufacture = $CimMonitor.YearOfManufacture
             }
 
             return [pscustomobject]$result
         }
 
-        $availableWmiMonitors = [System.Collections.Generic.List[object]]::new()
-        foreach ($wmiMonitor in @($WmiMonitorDetails)) {
-            [void]$availableWmiMonitors.Add($wmiMonitor)
+        $availableCimMonitors = [System.Collections.Generic.List[object]]::new()
+        foreach ($cimMonitor in @($CimMonitorDetails)) {
+            [void]$availableCimMonitors.Add($cimMonitor)
         }
 
         $assignments = @{}
@@ -1736,55 +1967,55 @@ PSCustomObject[]
 
         foreach ($monitor in @($detectedMonitors | Where-Object { $_.Description -ne 'Generic PnP Monitor' })) {
             $candidate = @(
-                @($availableWmiMonitors) |
+                @($availableCimMonitors) |
                 ForEach-Object {
                     [pscustomobject]@{
-                        WmiMonitor = $_
-                        Score      = Get-MonitorMatchScore -Monitor $monitor -WmiMonitor $_
+                        CimMonitor = $_
+                        Score      = Get-MonitorMatchScore -Monitor $monitor -CimMonitor $_
                     }
                 } |
                 Where-Object { $_.Score -gt 0 } |
-                Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = { [bool]$_.WmiMonitor.Active }; Descending = $true }
+                Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = { [bool]$_.CimMonitor.Active }; Descending = $true }
             ) | Select-Object -First 1
 
             if ($null -ne $candidate) {
-                $assignments[[string]$monitor.Id] = $candidate.WmiMonitor
-                [void]$availableWmiMonitors.Remove($candidate.WmiMonitor)
+                $assignments[[string]$monitor.Id] = $candidate.CimMonitor
+                [void]$availableCimMonitors.Remove($candidate.CimMonitor)
             }
         }
 
         foreach ($monitor in @($detectedMonitors | Where-Object { -not $assignments.ContainsKey([string]$_.Id) })) {
-            $selectedWmiMonitor = $null
+            $selectedCimMonitor = $null
             $candidate = @(
-                @($availableWmiMonitors) |
+                @($availableCimMonitors) |
                 ForEach-Object {
                     [pscustomobject]@{
-                        WmiMonitor = $_
-                        Score      = Get-MonitorMatchScore -Monitor $monitor -WmiMonitor $_
+                        CimMonitor = $_
+                        Score      = Get-MonitorMatchScore -Monitor $monitor -CimMonitor $_
                     }
                 } |
                 Where-Object { $_.Score -gt 0 } |
-                Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = { [bool]$_.WmiMonitor.Active }; Descending = $true }
+                Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = { [bool]$_.CimMonitor.Active }; Descending = $true }
             ) | Select-Object -First 1
 
             if ($null -ne $candidate) {
-                $selectedWmiMonitor = $candidate.WmiMonitor
+                $selectedCimMonitor = $candidate.CimMonitor
             }
 
-            if ($null -ne $selectedWmiMonitor) {
-                $assignments[[string]$monitor.Id] = $selectedWmiMonitor
-                [void]$availableWmiMonitors.Remove($selectedWmiMonitor)
+            if ($null -ne $selectedCimMonitor) {
+                $assignments[[string]$monitor.Id] = $selectedCimMonitor
+                [void]$availableCimMonitors.Remove($selectedCimMonitor)
             }
         }
 
         return @(
             foreach ($monitor in $detectedMonitors) {
-                $assignedWmiMonitor = $null
+                $assignedCimMonitor = $null
                 if ($assignments.ContainsKey([string]$monitor.Id)) {
-                    $assignedWmiMonitor = $assignments[[string]$monitor.Id]
+                    $assignedCimMonitor = $assignments[[string]$monitor.Id]
                 }
 
-                New-EnrichedMonitorObject -Monitor $monitor -WmiMonitor $assignedWmiMonitor
+                New-EnrichedMonitorObject -Monitor $monitor -CimMonitor $assignedCimMonitor
             }
         )
     }
@@ -1824,9 +2055,9 @@ PSCustomObject[]
                 }
             }
         )
-        $wmiMonitorDetails = @(Get-WmiMonitorDetails)
+        $cimMonitorDetails = @(Get-CimMonitorDetails)
 
-        return @(Add-WmiMonitorDetails -Monitors @($detectResult) -WmiMonitorDetails $wmiMonitorDetails)
+        return @(Add-CimMonitorDetails -Monitors @($detectResult) -CimMonitorDetails $cimMonitorDetails)
     }
 
     function Get-DetectOnlyMonitors {
@@ -1870,6 +2101,7 @@ PSCustomObject[]
                     CurrentInputSourceCode    = if ($null -ne $currentInputSourceDescriptor) { [string]$currentInputSourceDescriptor.Code } else { $null }
                     AvailableInputSources     = @($availableInputSourceDescriptors | Where-Object { $_.IsKnown } | ForEach-Object { [string]$_.FriendlyName } | Select-Object -Unique)
                     AvailableInputSourceCodes = @($availableInputSourceDescriptors | Where-Object { $_.IsKnown } | ForEach-Object { [string]$_.Code } | Select-Object -Unique)
+                    AvailableInputSourceNames = @($availableInputSourceDescriptors | Where-Object { $_.IsKnown -and -not [string]::IsNullOrWhiteSpace([string]$_.LegacyName) } | ForEach-Object { [string]$_.LegacyName } | Select-Object -Unique)
                 }
             }
         )
@@ -1914,10 +2146,28 @@ Returns selected display IDs as strings.
 #>
     function Get-MonitorIds {
         [CmdletBinding()]
-        param()
+        param(
+            [object[]]$DetectedMonitors = $null
+        )
 
-        $detectedMonitors = @(Get-ResolvedDetectedMonitors -IgnoreExitCode)
+        if ($null -eq $DetectedMonitors) {
+            $DetectedMonitors = @(Get-ResolvedDetectedMonitors -IgnoreExitCode)
+        }
+
         $requestedMonitorSelections = @(Get-NormalizedMonitorSelections)
+
+        if ($requestedMonitorSelections.Count -eq 0 -and
+            $null -ne $script:DefaultMonitorSerialNumbers -and
+            $script:DefaultMonitorSerialNumbers.Count -gt 0) {
+            return @(
+                $DetectedMonitors |
+                Where-Object { $script:DefaultMonitorSerialNumbers -contains ([string]$_.SerialNumber) } |
+                Sort-Object -Property @{ Expression = { [array]::IndexOf($script:DefaultMonitorSerialNumbers, [string]$_.SerialNumber) }; Descending = $false } |
+                ForEach-Object { [string]$_.Id } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            )
+        }
+
         $requestedMonitorIds = @(
             $requestedMonitorSelections |
             ForEach-Object {
@@ -1930,7 +2180,7 @@ Returns selected display IDs as strings.
         )
 
         return @(
-            @($detectedMonitors) |
+            @($DetectedMonitors) |
             Where-Object {
                 if ($requestedMonitorIds.Count -gt 0) {
                     return $requestedMonitorIds -contains ([string]$_.Id)
@@ -1970,6 +2220,12 @@ Returns selected display IDs after one or more detection attempts.
         param()
 
         $requestedMonitorSelections = @(Get-NormalizedMonitorSelections)
+        $usingSerialDefaults = (
+            $requestedMonitorSelections.Count -eq 0 -and
+            $null -ne $script:DefaultMonitorSerialNumbers -and
+            $script:DefaultMonitorSerialNumbers.Count -gt 0
+        )
+
         $requestedMonitorIds = @(
             $requestedMonitorSelections |
             ForEach-Object {
@@ -1982,26 +2238,38 @@ Returns selected display IDs after one or more detection attempts.
         )
 
         for ($attempt = 1; $attempt -le $DetectRetryCount; $attempt++) {
-            $monitorIds = @(Get-MonitorIds)
             $detectedMonitors = @(Get-ResolvedDetectedMonitors -IgnoreExitCode)
-            if ($requestedMonitorIds.Count -gt 0) {
-                $missingMonitors = @($requestedMonitorIds | Where-Object { $monitorIds -notcontains $_ })
-            }
-            else {
-                $detectedResolvedDescriptions = @(
-                    $detectedMonitors |
-                    ForEach-Object {
-                        if (-not [string]::IsNullOrWhiteSpace([string]$_.ResolvedDescription)) {
-                            [string]$_.ResolvedDescription
-                        }
-                        else {
-                            [string]$_.Description
-                        }
-                    } |
-                    Select-Object -Unique
-                )
-                $missingMonitors = @($requestedMonitorSelections | Where-Object { $detectedResolvedDescriptions -notcontains $_ })
-            }
+            $monitorIds = @(Get-MonitorIds -DetectedMonitors $detectedMonitors)
+
+            # Wrap in @() so that an empty result from the winning branch is preserved as
+            # an empty array rather than unwrapped to $null by the pipeline, which would
+            # make $missingMonitors.Count throw under Set-StrictMode -Version Latest.
+            $missingMonitors = @(if ($usingSerialDefaults) {
+                    $detectedSerials = @(
+                        $detectedMonitors |
+                        Where-Object { $monitorIds -contains ([string]$_.Id) } |
+                        ForEach-Object { [string]$_.SerialNumber }
+                    )
+                    $script:DefaultMonitorSerialNumbers | Where-Object { $detectedSerials -notcontains $_ }
+                }
+                elseif ($requestedMonitorIds.Count -gt 0) {
+                    $requestedMonitorIds | Where-Object { $monitorIds -notcontains $_ }
+                }
+                else {
+                    $detectedResolvedDescriptions = @(
+                        $detectedMonitors |
+                        ForEach-Object {
+                            if (-not [string]::IsNullOrWhiteSpace([string]$_.ResolvedDescription)) {
+                                [string]$_.ResolvedDescription
+                            }
+                            else {
+                                [string]$_.Description
+                            }
+                        } |
+                        Select-Object -Unique
+                    )
+                    $requestedMonitorSelections | Where-Object { $detectedResolvedDescriptions -notcontains $_ }
+                })
 
             if ($missingMonitors.Count -eq 0) {
                 Write-Log -Message "Detected $($monitorIds.Count) requested monitor(s) on attempt ${attempt}: $($monitorIds -join ', ')"
@@ -2014,7 +2282,14 @@ Returns selected display IDs after one or more detection attempts.
             }
         }
 
-        throw "Requested monitor(s) $($requestedMonitorSelections -join ', ') were not all detected after $DetectRetryCount attempts."
+        $selectionDescription = if ($usingSerialDefaults) {
+            $script:DefaultMonitorSerialNumbers -join ', '
+        }
+        else {
+            $requestedMonitorSelections -join ', '
+        }
+
+        throw "Requested monitor(s) $selectionDescription were not all detected after $DetectRetryCount attempts."
     }
 
     function Assert-MonitorInputSourceSupported {
@@ -2230,10 +2505,11 @@ Verifies that the log directory can be used by the current user.
             }
 
 
-        try {
-            Write-Host $entry
-        } catch {
-        }
+            try {
+                Write-Host $entry
+            }
+            catch {
+            }
             throw
         }
     }

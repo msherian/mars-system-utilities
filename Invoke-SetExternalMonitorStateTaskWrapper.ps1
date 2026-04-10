@@ -261,11 +261,11 @@ function Get-ScheduledTaskContextForCurrentProcess {
     $triggerClassification = Get-ScheduledTaskTriggerClassification -TaskName $taskName -TaskStartTime $resolvedTaskStartTime -TaskLaunchTime ([datetime]$selected.Event.TimeCreated)
 
     return [pscustomobject]@{
-        TaskName       = $taskName
-        TaskInstanceId = if ($null -ne $actionStartEvent) { [string]$actionStartEvent.EventData.TaskInstanceId } elseif ($null -ne $taskStartEvent) { [string]$taskStartEvent.EventData.InstanceId } else { $null }
-        TaskActionName = if ($null -ne $actionStartEvent) { [string]$actionStartEvent.EventData.ActionName } else { $null }
-        TaskStartTime  = $resolvedTaskStartTime
-        TaskLaunchTime = [datetime]$selected.Event.TimeCreated
+        TaskName          = $taskName
+        TaskInstanceId    = if ($null -ne $actionStartEvent) { [string]$actionStartEvent.EventData.TaskInstanceId } elseif ($null -ne $taskStartEvent) { [string]$taskStartEvent.EventData.InstanceId } else { $null }
+        TaskActionName    = if ($null -ne $actionStartEvent) { [string]$actionStartEvent.EventData.ActionName } else { $null }
+        TaskStartTime     = $resolvedTaskStartTime
+        TaskLaunchTime    = [datetime]$selected.Event.TimeCreated
         TaskTriggerSource = [string]$triggerClassification.TriggerSource
         TaskTriggerReason = [string]$triggerClassification.Reason
     }
@@ -334,7 +334,7 @@ function Get-ScheduledTaskTriggerClassification {
     }
 
     $recentLogonEvent = $null
-    $logonDetectionWindow = [TimeSpan]::FromSeconds(30)
+    $logonDetectionWindow = [TimeSpan]::FromSeconds(60)
 
     if ($supportsLogonTrigger -and $referenceTime -is [datetime]) {
         try {
@@ -522,10 +522,9 @@ try {
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $hostPath
     $startInfo.UseShellExecute = $false
-    $startInfo.RedirectStandardOutput = $false
-    $startInfo.RedirectStandardError = $false
     $startInfo.CreateNoWindow = $true
     [void]$startInfo.ArgumentList.Add('-NoProfile')
+    [void]$startInfo.ArgumentList.Add('-NonInteractive')
     [void]$startInfo.ArgumentList.Add('-ExecutionPolicy')
     [void]$startInfo.ArgumentList.Add('Bypass')
     [void]$startInfo.ArgumentList.Add('-File')
@@ -536,12 +535,7 @@ try {
     [void]$startInfo.ArgumentList.Add((Split-Path -Path $resolvedLogPath -Leaf))
 
     $startInfo.EnvironmentVariables['SET_EXTERNAL_MONITOR_INVOCATION_MODE'] = if ($null -ne $taskContext) { 'ScheduledTask' } else { 'Interactive' }
-    $startInfo.EnvironmentVariables['SET_EXTERNAL_MONITOR_INVOCATION_REASON'] = if ($null -ne $taskContext) {
-        'Invocation context was forwarded by Invoke-SetExternalMonitorStateTaskWrapper.ps1.'
-    }
-    else {
-        'Invocation context was forwarded by Invoke-SetExternalMonitorStateTaskWrapper.ps1.'
-    }
+    $startInfo.EnvironmentVariables['SET_EXTERNAL_MONITOR_INVOCATION_REASON'] = 'Invocation context was forwarded by Invoke-SetExternalMonitorStateTaskWrapper.ps1.'
     $startInfo.EnvironmentVariables['SET_EXTERNAL_MONITOR_WRAPPER_PROCESS_ID'] = [string]$PID
     $startInfo.EnvironmentVariables['SET_EXTERNAL_MONITOR_WRAPPER_PROCESS_NAME'] = [string](Get-Process -Id $PID -ErrorAction Stop).ProcessName
 
@@ -569,7 +563,8 @@ try {
     $childProcess.WaitForExit()
     $exitCode = $childProcess.ExitCode
 
-    Write-WrapperLog -LogPath $resolvedLogPath -Message "Child monitor-state script exited with code $exitCode."
+    $exitLogLevel = if ($exitCode -ne 0) { 'WARN' } else { 'INFO' }
+    Write-WrapperLog -LogPath $resolvedLogPath -Message "Child monitor-state script exited with code $exitCode." -Level $exitLogLevel
 
     if ($null -ne $taskContext) {
         Start-TaskHistoryFinalizer -TaskName $taskContext.TaskName -TaskInstanceId $taskContext.TaskInstanceId -LogPath $resolvedLogPath
