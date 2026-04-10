@@ -127,9 +127,18 @@ function Get-ProcessAncestry {
     $visitedProcessIds = [System.Collections.Generic.HashSet[int]]::new()
     $currentProcessId = [int]$PID
 
+    $allCimProcesses = @{}
+    foreach ($cimProc in @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
+        $allCimProcesses[[int]$cimProc.ProcessId] = $cimProc
+    }
+
     while ($currentProcessId -gt 0 -and $visitedProcessIds.Add($currentProcessId)) {
+        $processRecord = $allCimProcesses[$currentProcessId]
+        if ($null -eq $processRecord) {
+            break
+        }
+
         try {
-            $processRecord = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $currentProcessId" -ErrorAction Stop
             $processObject = Get-Process -Id $currentProcessId -ErrorAction Stop
         }
         catch {
@@ -225,31 +234,28 @@ function Get-ScheduledTaskContextForCurrentProcess {
     )
 
     $taskName = [string]$selected.EventData.TaskName
-    $actionStartEvent = @(
-        foreach ($historyEvent in $taskHistory) {
-            $historyData = Get-TaskSchedulerEventData -EventRecord $historyEvent
-            if ([string]$historyData.TaskName -ne $taskName) {
-                continue
-            }
+    $actionStartCandidates = [System.Collections.Generic.List[object]]::new()
+    $taskStartCandidates = [System.Collections.Generic.List[object]]::new()
 
-            if ($historyEvent.Id -eq 200 -and [string]$historyData.TaskInstanceId) {
-                [pscustomobject]@{ Event = $historyEvent; EventData = $historyData }
-            }
+    foreach ($historyEvent in $taskHistory) {
+        $historyData = Get-TaskSchedulerEventData -EventRecord $historyEvent
+        if ([string]$historyData.TaskName -ne $taskName) {
+            continue
         }
-    ) | Sort-Object -Property @{ Expression = { $_.Event.TimeCreated }; Descending = $true } | Select-Object -First 1
 
-    $taskStartEvent = @(
-        foreach ($historyEvent in $taskHistory) {
-            $historyData = Get-TaskSchedulerEventData -EventRecord $historyEvent
-            if ([string]$historyData.TaskName -ne $taskName) {
-                continue
-            }
+        $entry = [pscustomobject]@{ Event = $historyEvent; EventData = $historyData }
 
-            if ($historyEvent.Id -eq 100) {
-                [pscustomobject]@{ Event = $historyEvent; EventData = $historyData }
-            }
+        if ($historyEvent.Id -eq 200 -and [string]$historyData.TaskInstanceId) {
+            [void]$actionStartCandidates.Add($entry)
         }
-    ) | Sort-Object -Property @{ Expression = { $_.Event.TimeCreated }; Descending = $true } | Select-Object -First 1
+
+        if ($historyEvent.Id -eq 100) {
+            [void]$taskStartCandidates.Add($entry)
+        }
+    }
+
+    $actionStartEvent = @($actionStartCandidates | Sort-Object -Property @{ Expression = { $_.Event.TimeCreated }; Descending = $true }) | Select-Object -First 1
+    $taskStartEvent = @($taskStartCandidates | Sort-Object -Property @{ Expression = { $_.Event.TimeCreated }; Descending = $true }) | Select-Object -First 1
 
     $resolvedTaskStartTime = if ($null -ne $taskStartEvent) {
         [datetime]$taskStartEvent.Event.TimeCreated

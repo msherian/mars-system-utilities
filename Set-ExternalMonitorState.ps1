@@ -168,13 +168,13 @@ param(
                 }
             }
 
-            # For Generic PnP Monitors: fetch capabilities → extract model() for WMI matching.
+            # For Generic PnP Monitors: fetch capabilities → extract model() for CIM matching.
             foreach ($det in @($detected | Where-Object { $_.Description -eq 'Generic PnP Monitor' })) {
                 $capText = (& $runWinddcutil $ddcUtilPath @('capabilities', $det.Id)).Trim()
                 if ($capText -match 'model\((?<Model>[^\)]+)\)') { $det.CapabilitiesModel = $Matches.Model.Trim() }
             }
 
-            # WMI monitor details.
+            # CIM monitor details.
             $cimMonitors = [System.Collections.Generic.List[pscustomobject]]::new()
             try {
                 foreach ($w in @(Get-CimInstance -ClassName WMIMonitorID -Namespace root\wmi -ErrorAction Stop)) {
@@ -191,7 +191,7 @@ param(
             }
             catch { }
 
-            # Score a detected monitor against a WMI entry (mirrors Add-CimMonitorDetails).
+            # Score a detected monitor against a CIM entry (mirrors Add-CimMonitorDetails).
             $scoreCim = {
                 param($det, $cim)
                 $s   = 0
@@ -216,7 +216,7 @@ param(
                 $s
             }
 
-            # Assign WMI entries to detected monitors (specific monitors first, generics after).
+            # Assign CIM entries to detected monitors (specific monitors first, generics after).
             $cimAssignments = @{}
             $availableCim = [System.Collections.Generic.List[pscustomobject]]::new($cimMonitors)
             foreach ($pass in @('specific', 'generic')) {
@@ -351,13 +351,13 @@ param(
                     }
                 }
 
-                # For Generic PnP Monitors: fetch capabilities → extract model() for WMI matching.
+                # For Generic PnP Monitors: fetch capabilities → extract model() for CIM matching.
                 foreach ($det in @($detected | Where-Object { $_.Description -eq 'Generic PnP Monitor' })) {
                     $capText = (& $runWinddcutil $ddcUtilPath @('capabilities', $det.Id)).Trim()
                     if ($capText -match 'model\((?<Model>[^\)]+)\)') { $det.CapabilitiesModel = $Matches.Model.Trim() }
                 }
 
-                # WMI monitor details.
+                # CIM monitor details.
                 $cimMonitors = [System.Collections.Generic.List[pscustomobject]]::new()
                 try {
                     foreach ($w in @(Get-CimInstance -ClassName WMIMonitorID -Namespace root\wmi -ErrorAction Stop)) {
@@ -373,7 +373,7 @@ param(
                 }
                 catch { }
 
-                # Score a detected monitor against a WMI entry (mirrors Add-CimMonitorDetails).
+                # Score a detected monitor against a CIM entry (mirrors Add-CimMonitorDetails).
                 $scoreCim = {
                     param($det, $cim)
                     $s   = 0
@@ -398,7 +398,7 @@ param(
                     $s
                 }
 
-                # Assign WMI entries to detected monitors (specific monitors first, generics after).
+                # Assign CIM entries to detected monitors (specific monitors first, generics after).
                 $cimAssignments = @{}
                 $availableCim = [System.Collections.Generic.List[pscustomobject]]::new($cimMonitors)
                 foreach ($pass in @('specific', 'generic')) {
@@ -537,6 +537,7 @@ end {
     $MaxLogSizeBytes = 100MB
     $MaxLogAge = [TimeSpan]::FromDays(14)
     $TaskSchedulerHistoryLogName = 'Microsoft-Windows-TaskScheduler/Operational'
+    $script:MonitorCapabilitiesCache = @{}
     $InputSourceValueMap = @{
         'DisplayPort-1'  = '0x0F'
         'DisplayPort-2'  = '0x10'
@@ -1051,9 +1052,18 @@ Writes an informational log entry.
         $visitedProcessIds = [System.Collections.Generic.HashSet[int]]::new()
         $currentProcessId = [int]$PID
 
+        $allCimProcesses = @{}
+        foreach ($cimProc in @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
+            $allCimProcesses[[int]$cimProc.ProcessId] = $cimProc
+        }
+
         while ($currentProcessId -gt 0 -and $visitedProcessIds.Add($currentProcessId)) {
+            $processRecord = $allCimProcesses[$currentProcessId]
+            if ($null -eq $processRecord) {
+                break
+            }
+
             try {
-                $processRecord = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $currentProcessId" -ErrorAction Stop
                 $processObject = Get-Process -Id $currentProcessId -ErrorAction Stop
             }
             catch {
@@ -1430,8 +1440,9 @@ Sets the input source for display 3 to the specified VCP value.
             $process.StartInfo = $startInfo
             [void]$process.Start()
 
+            $stderrTask = $process.StandardError.ReadToEndAsync()
             $standardOutput = $process.StandardOutput.ReadToEnd()
-            $standardError = $process.StandardError.ReadToEnd()
+            $standardError = $stderrTask.GetAwaiter().GetResult()
             $process.WaitForExit()
             $exitCode = $process.ExitCode
         }
@@ -1550,8 +1561,9 @@ Returns all detected monitors as objects.
             $process.StartInfo = $startInfo
             [void]$process.Start()
 
+            $stderrTask = $process.StandardError.ReadToEndAsync()
             $standardOutput = $process.StandardOutput.ReadToEnd()
-            $standardError = $process.StandardError.ReadToEnd()
+            $standardError = $stderrTask.GetAwaiter().GetResult()
             $process.WaitForExit()
             $exitCode = $process.ExitCode
         }
@@ -1592,11 +1604,11 @@ Returns all detected monitors as objects.
 
     <#
 .SYNOPSIS
-Gets monitor details from WMIMonitorID.
+Gets monitor details from CIM (WMIMonitorID).
 
 .DESCRIPTION
-Queries the root\wmi namespace for WMIMonitorID instances and returns friendly
-monitor properties normalized from the underlying character arrays.
+Queries the root\wmi namespace for WMIMonitorID CIM instances and returns
+friendly monitor properties normalized from the underlying character arrays.
 
 .OUTPUTS
 PSCustomObject[]
@@ -1604,7 +1616,7 @@ PSCustomObject[]
 .EXAMPLE
 Get-CimMonitorDetails
 
-Returns monitor details reported by WMIMonitorID.
+Returns monitor details reported by the WMIMonitorID CIM class.
 #>
     function Get-CimMonitorDetails {
         [CmdletBinding()]
@@ -1675,8 +1687,14 @@ Returns monitor details reported by WMIMonitorID.
         )
 
         try {
-            $capabilitiesResult = Invoke-Winddcutil -Capabilities -Display $MonitorId -IgnoreExitCode
-            $capabilitiesText = [string]$capabilitiesResult.Capabilities
+            if ($script:MonitorCapabilitiesCache.ContainsKey($MonitorId)) {
+                $capabilitiesText = $script:MonitorCapabilitiesCache[$MonitorId]
+            }
+            else {
+                $capabilitiesResult = Invoke-Winddcutil -Capabilities -Display $MonitorId -IgnoreExitCode
+                $capabilitiesText = [string]$capabilitiesResult.Capabilities
+                $script:MonitorCapabilitiesCache[$MonitorId] = $capabilitiesText
+            }
         }
         catch {
             return $null
@@ -1781,8 +1799,14 @@ Returns monitor details reported by WMIMonitorID.
             [string]$MonitorId
         )
 
-        $capabilitiesResult = Invoke-Winddcutil -Capabilities -Display $MonitorId -IgnoreExitCode
-        $capabilitiesText = [string]$capabilitiesResult.Capabilities
+        if ($script:MonitorCapabilitiesCache.ContainsKey($MonitorId)) {
+            $capabilitiesText = $script:MonitorCapabilitiesCache[$MonitorId]
+        }
+        else {
+            $capabilitiesResult = Invoke-Winddcutil -Capabilities -Display $MonitorId -IgnoreExitCode
+            $capabilitiesText = [string]$capabilitiesResult.Capabilities
+            $script:MonitorCapabilitiesCache[$MonitorId] = $capabilitiesText
+        }
         if ([string]::IsNullOrWhiteSpace($capabilitiesText)) {
             return @()
         }
@@ -1827,19 +1851,19 @@ Returns monitor details reported by WMIMonitorID.
         )
 
         $currentInputValue = Get-MonitorVcpValue -MonitorId $MonitorId -Code $InputSourceCode
-        $normalizedCurrentInputValue = Normalize-VcpValueForComparison -Code $InputSourceCode -Value $currentInputValue
+        $normalizedCurrentInputValue = Convert-VcpValueForComparison -Code $InputSourceCode -Value $currentInputValue
 
         return (Get-MonitorInputSourceDescriptor -Value $normalizedCurrentInputValue)
     }
 
     <#
 .SYNOPSIS
-Adds WMIMonitorID details to detected monitor objects.
+Adds CIM monitor details to detected monitor objects.
 
 .DESCRIPTION
-Merges winddcutil detect results with WMIMonitorID monitor metadata using a
-one-to-one assignment so each detected monitor is paired with at most one WMI
-record. Specific matches are assigned first, and any remaining WMI records are
+Merges winddcutil detect results with WMIMonitorID CIM metadata using a
+one-to-one assignment so each detected monitor is paired with at most one CIM
+record. Specific matches are assigned first, and any remaining CIM records are
 used to resolve generic monitor descriptions.
 
 .PARAMETER Monitors
@@ -2022,10 +2046,10 @@ PSCustomObject[]
 
     <#
 .SYNOPSIS
-Gets detected monitors enriched with WMIMonitorID details.
+Gets detected monitors enriched with CIM monitor details.
 
 .DESCRIPTION
-Combines winddcutil detect output with WMIMonitorID metadata and returns the
+Combines winddcutil detect output with WMIMonitorID CIM metadata and returns the
 same enriched monitor objects used by DetectOnly.
 
 .PARAMETER IgnoreExitCode
