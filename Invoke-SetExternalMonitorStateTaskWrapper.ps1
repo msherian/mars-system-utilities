@@ -183,7 +183,7 @@ function Get-ScheduledTaskContextForCurrentProcess {
         return $null
     }
 
-    $matchingLaunchEvents = @(
+    $launchCandidates = @(
         foreach ($launchEvent in $launchEvents) {
             $eventData = Get-TaskSchedulerEventData -EventRecord $launchEvent
             $processId = 0
@@ -195,20 +195,20 @@ function Get-ScheduledTaskContextForCurrentProcess {
                 continue
             }
 
-            $matchedProcess = $processesById[$processId]
+            $processEntry = $processesById[$processId]
 
             [pscustomobject]@{
                 Event            = $launchEvent
                 EventData        = $eventData
-                MatchedProcess   = $matchedProcess
-                IsCurrentProcess = ($matchedProcess.ProcessId -eq $PID)
-                Delta            = [math]::Abs(($launchEvent.TimeCreated - $matchedProcess.StartTime).TotalSeconds)
+                MatchedProcess   = $processEntry
+                IsCurrentProcess = ($processEntry.ProcessId -eq $PID)
+                Delta            = [math]::Abs(($launchEvent.TimeCreated - $processEntry.StartTime).TotalSeconds)
             }
         }
     )
 
     $selected = @(
-        $matchingLaunchEvents |
+        $launchCandidates |
         Sort-Object -Property @{ Expression = 'IsCurrentProcess'; Descending = $true }, @{ Expression = 'Delta'; Descending = $false }, @{ Expression = { $_.Event.TimeCreated }; Descending = $true }
     ) | Select-Object -First 1
 
@@ -281,9 +281,10 @@ function Get-ScheduledTaskDefinitionXml {
     $taskPath = '\'
     $shortTaskName = $TaskName.Trim()
 
-    if ($shortTaskName -match '^(?<TaskPath>.*\\)(?<ShortTaskName>[^\\]+)$') {
-        $taskPath = [string]$Matches.TaskPath
-        $shortTaskName = [string]$Matches.ShortTaskName
+    $taskNameParts = [regex]::Match($shortTaskName, '^(?<TaskPath>.*\\)(?<ShortTaskName>[^\\]+)$')
+    if ($taskNameParts.Success) {
+        $taskPath = [string]$taskNameParts.Groups['TaskPath'].Value
+        $shortTaskName = [string]$taskNameParts.Groups['ShortTaskName'].Value
     }
 
     try {
@@ -407,22 +408,22 @@ function Get-ScheduledTaskCompletionEvent {
         } -ErrorAction SilentlyContinue
     )
 
-    $matchingCompletionEvents = @(
+    $completionCandidates = @(
         foreach ($historyEvent in $historyEvents) {
             $historyData = Get-TaskSchedulerEventData -EventRecord $historyEvent
             if ([string]$historyData.TaskName -ne $TaskName) {
                 continue
             }
 
-            $instanceMatches = $true
+            $sameInstance = $true
             if (-not [string]::IsNullOrWhiteSpace($TaskInstanceId)) {
-                $instanceMatches = (
+                $sameInstance = (
                     ([string]$historyData.TaskInstanceId -eq $TaskInstanceId) -or
                     ([string]$historyData.InstanceId -eq $TaskInstanceId)
                 )
             }
 
-            if (-not $instanceMatches) {
+            if (-not $sameInstance) {
                 continue
             }
 
@@ -434,7 +435,7 @@ function Get-ScheduledTaskCompletionEvent {
     )
 
     return @(
-        $matchingCompletionEvents |
+        $completionCandidates |
         Sort-Object -Property @{ Expression = { $_.Event.TimeCreated }; Descending = $true }
     ) | Select-Object -First 1
 }
