@@ -113,6 +113,15 @@ param(
     [ArgumentCompleter({
             param($commandName, $parameterName, $wordToComplete, $commandAst, $fakeBoundParameters)
 
+            # Initialize shared completer cache (survives across tab completions within the session).
+            if ($null -eq $global:__SetExternalMonitorCompleterCache -or $global:__SetExternalMonitorCompleterCache -isnot [hashtable]) {
+                $global:__SetExternalMonitorCompleterCache = @{
+                    DdcUtilPath = ''; DetectFingerprint = ''; Enriched = @()
+                    Capabilities = @{}; Timestamp = [datetime]::MinValue
+                }
+            }
+            $cache = $global:__SetExternalMonitorCompleterCache
+
             # Resolve winddcutil path — use the explicitly bound value, or probe known locations.
             $ddcUtilPath = if ($fakeBoundParameters.ContainsKey('DdcUtilPath')) {
                 [string]$fakeBoundParameters.DdcUtilPath
@@ -168,9 +177,28 @@ param(
                 }
             }
 
+            # Check cache validity — reuse enriched data if detect returned identical monitors.
+            $detectFingerprint = ($detected | ForEach-Object { '{0}:{1}' -f $_.Id, $_.Description }) -join '|'
+            $cacheValid = (
+                $cache.DetectFingerprint -eq $detectFingerprint -and
+                $cache.DdcUtilPath -eq $ddcUtilPath -and
+                ((Get-Date) - $cache.Timestamp) -lt ([TimeSpan]::FromSeconds(60)) -and
+                $cache.Enriched.Count -gt 0
+            )
+
+            if ($cacheValid) {
+                $enriched = $cache.Enriched
+            }
+
+            if (-not $cacheValid) {
+
+            # Monitor IDs may have changed — clear stale capabilities keyed by old IDs.
+            $cache.Capabilities = @{}
+
             # For Generic PnP Monitors: fetch capabilities → extract model() for CIM matching.
             foreach ($det in @($detected | Where-Object { $_.Description -eq 'Generic PnP Monitor' })) {
                 $capText = (& $runWinddcutil $ddcUtilPath @('capabilities', $det.Id)).Trim()
+                $cache.Capabilities[[string]$det.Id] = $capText
                 if ($capText -match 'model\((?<Model>[^\)]+)\)') { $det.CapabilitiesModel = $Matches.Model.Trim() }
             }
 
@@ -255,6 +283,13 @@ param(
                 }
             )
 
+            # Update shared completer cache.
+            $cache.DdcUtilPath = $ddcUtilPath
+            $cache.DetectFingerprint = $detectFingerprint
+            $cache.Enriched = $enriched
+            $cache.Timestamp = Get-Date
+            }
+
             if ($enriched.Count -eq 0) {
                 [System.Management.Automation.CompletionResult]::new("''", '(No monitors detected)', 'ParameterValue', 'winddcutil detect returned no monitors.')
                 return
@@ -298,6 +333,15 @@ param(
 
             # Default when winddcutil is unavailable or no monitors are selected.
             $availableInputSources = @($InputSourceValueMap.Keys)
+
+            # Initialize shared completer cache (survives across tab completions within the session).
+            if ($null -eq $global:__SetExternalMonitorCompleterCache -or $global:__SetExternalMonitorCompleterCache -isnot [hashtable]) {
+                $global:__SetExternalMonitorCompleterCache = @{
+                    DdcUtilPath = ''; DetectFingerprint = ''; Enriched = @()
+                    Capabilities = @{}; Timestamp = [datetime]::MinValue
+                }
+            }
+            $cache = $global:__SetExternalMonitorCompleterCache
 
             # Resolve winddcutil path — use the explicitly bound value, or probe known locations.
             $ddcUtilPath = if ($fakeBoundParameters.ContainsKey('DdcUtilPath')) {
@@ -351,9 +395,28 @@ param(
                     }
                 }
 
+                # Check cache validity — reuse enriched data if detect returned identical monitors.
+                $detectFingerprint = ($detected | ForEach-Object { '{0}:{1}' -f $_.Id, $_.Description }) -join '|'
+                $cacheValid = (
+                    $cache.DetectFingerprint -eq $detectFingerprint -and
+                    $cache.DdcUtilPath -eq $ddcUtilPath -and
+                    ((Get-Date) - $cache.Timestamp) -lt ([TimeSpan]::FromSeconds(60)) -and
+                    $cache.Enriched.Count -gt 0
+                )
+
+                if ($cacheValid) {
+                    $enriched = $cache.Enriched
+                }
+
+                if (-not $cacheValid) {
+
+                # Monitor IDs may have changed — clear stale capabilities keyed by old IDs.
+                $cache.Capabilities = @{}
+
                 # For Generic PnP Monitors: fetch capabilities → extract model() for CIM matching.
                 foreach ($det in @($detected | Where-Object { $_.Description -eq 'Generic PnP Monitor' })) {
                     $capText = (& $runWinddcutil $ddcUtilPath @('capabilities', $det.Id)).Trim()
+                    $cache.Capabilities[[string]$det.Id] = $capText
                     if ($capText -match 'model\((?<Model>[^\)]+)\)') { $det.CapabilitiesModel = $Matches.Model.Trim() }
                 }
 
@@ -362,12 +425,13 @@ param(
                 try {
                     foreach ($w in @(Get-CimInstance -ClassName WMIMonitorID -Namespace root\wmi -ErrorAction Stop)) {
                         $fn  = (-join [char[]](@($w.UserFriendlyName | Where-Object { $_ -gt 0 }))).Trim()
+                        $sn  = (-join [char[]](@($w.SerialNumberID   | Where-Object { $_ -gt 0 }))).Trim()
                         $mfr = (-join [char[]](@($w.ManufacturerName  | Where-Object { $_ -gt 0 }))).Trim()
                         $inst = [string]$w.InstanceName
                         $dc  = if (($inst -split '\\').Count -ge 2) { ($inst -split '\\')[1] } else { '' }
                         [void]$cimMonitors.Add([pscustomobject]@{
-                                UserFriendlyName = $fn; Manufacturer = $mfr
-                                DeviceCode = $dc; Active = [bool]$w.Active
+                                UserFriendlyName = $fn; SerialNumber = $sn
+                                Manufacturer     = $mfr; DeviceCode = $dc; Active = [bool]$w.Active
                             })
                     }
                 }
@@ -429,9 +493,20 @@ param(
                                 $desc = $_.CapabilitiesModel
                             }
                         }
-                        [pscustomobject]@{ Id = $_.Id; Description = $desc }
+                        [pscustomobject]@{
+                            Id           = $_.Id
+                            Description  = $desc
+                            SerialNumber = if ($null -ne $cim) { $cim.SerialNumber } else { '' }
+                        }
                     }
                 )
+
+                # Update shared completer cache.
+                $cache.DdcUtilPath = $ddcUtilPath
+                $cache.DetectFingerprint = $detectFingerprint
+                $cache.Enriched = $enriched
+                $cache.Timestamp = Get-Date
+                }
 
                 if ($fakeBoundParameters.ContainsKey('Monitors')) {
                     # Parse selected monitor selections into (Id, Label) pairs.
@@ -461,8 +536,15 @@ param(
                             if ($ts -gt 0 -and $tot -gt $bestTotal) { $bestTotal = $tot; $resolvedId = $e.Id }
                         }
 
-                        # Get VCP 60 input sources for the resolved monitor.
-                        $capText = (& $runWinddcutil $ddcUtilPath @('capabilities', $resolvedId)).Trim()
+                        # Get VCP 60 input sources for the resolved monitor (cache-aware).
+                        $capText = if ($cache.Capabilities.ContainsKey([string]$resolvedId)) {
+                            $cache.Capabilities[[string]$resolvedId]
+                        }
+                        else {
+                            $result = (& $runWinddcutil $ddcUtilPath @('capabilities', $resolvedId)).Trim()
+                            $cache.Capabilities[[string]$resolvedId] = $result
+                            $result
+                        }
                         $availableInputSources = @()
                         if ($capText -match '60\((?<Values>[^\)]+)\)') {
                             $availableInputSources = @(
@@ -1737,16 +1819,16 @@ Returns monitor details reported by the WMIMonitorID CIM class.
                 return [pscustomobject]@{
                     Code         = '0x11'
                     IsKnown      = $true
-                    LegacyName   = 'HDMI-1'
-                    FriendlyName = 'HDMI-1'
+                    LegacyName   = 'HDMI1'
+                    FriendlyName = 'HDMI1'
                 }
             }
             '12' {
                 return [pscustomobject]@{
                     Code         = '0x12'
                     IsKnown      = $true
-                    LegacyName   = 'HDM-2'
-                    FriendlyName = 'HDMI-2'
+                    LegacyName   = 'HDMI2'
+                    FriendlyName = 'HDMI2'
                 }
             }
             '13' {
@@ -1754,7 +1836,7 @@ Returns monitor details reported by the WMIMonitorID CIM class.
                     Code         = '0x13'
                     IsKnown      = $true
                     LegacyName   = $null
-                    FriendlyName = 'HDMI-3'
+                    FriendlyName = 'HDMI3'
                 }
             }
             '14' {
@@ -1762,7 +1844,7 @@ Returns monitor details reported by the WMIMonitorID CIM class.
                     Code         = '0x14'
                     IsKnown      = $true
                     LegacyName   = $null
-                    FriendlyName = 'HDMI-4'
+                    FriendlyName = 'HDMI4'
                 }
             }
             '1B' {
