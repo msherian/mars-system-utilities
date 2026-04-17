@@ -178,7 +178,9 @@ param(
             }
 
             # Check cache validity — reuse enriched data if detect returned identical monitors.
-            $detectFingerprint = ($detected | ForEach-Object { '{0}:{1}' -f $_.Id, $_.Description }) -join '|'
+            $fpParts = [System.Collections.Generic.List[string]]::new($detected.Count)
+            foreach ($d in $detected) { [void]$fpParts.Add(('{0}:{1}' -f $d.Id, $d.Description)) }
+            $detectFingerprint = $fpParts -join '|'
             $cacheValid = (
                 $cache.DetectFingerprint -eq $detectFingerprint -and
                 $cache.DdcUtilPath -eq $ddcUtilPath -and
@@ -205,19 +207,26 @@ param(
             # CIM monitor details.
             $cimMonitors = [System.Collections.Generic.List[pscustomobject]]::new()
             try {
-                foreach ($w in @(Get-CimInstance -ClassName WMIMonitorID -Namespace root\wmi -ErrorAction Stop)) {
-                    $fn  = (-join [char[]](@($w.UserFriendlyName | Where-Object { $_ -gt 0 }))).Trim()
-                    $sn  = (-join [char[]](@($w.SerialNumberID   | Where-Object { $_ -gt 0 }))).Trim()
-                    $mfr = (-join [char[]](@($w.ManufacturerName  | Where-Object { $_ -gt 0 }))).Trim()
+                foreach ($w in Get-CimInstance -ClassName WMIMonitorID -Namespace root\wmi -ErrorAction Stop) {
+                    $fnSb = [System.Text.StringBuilder]::new(32)
+                    foreach ($b in $w.UserFriendlyName) { if ($b -gt 0) { [void]$fnSb.Append([char]$b) } }
+                    $snSb = [System.Text.StringBuilder]::new(32)
+                    foreach ($b in $w.SerialNumberID)   { if ($b -gt 0) { [void]$snSb.Append([char]$b) } }
+                    $mfrSb = [System.Text.StringBuilder]::new(16)
+                    foreach ($b in $w.ManufacturerName)  { if ($b -gt 0) { [void]$mfrSb.Append([char]$b) } }
                     $inst = [string]$w.InstanceName
-                    $dc  = if (($inst -split '\\').Count -ge 2) { ($inst -split '\\')[1] } else { '' }
+                    $instParts = $inst -split '\\'
+                    $dc  = if ($instParts.Count -ge 2) { $instParts[1] } else { '' }
                     [void]$cimMonitors.Add([pscustomobject]@{
-                            UserFriendlyName = $fn; SerialNumber = $sn
-                            Manufacturer     = $mfr; DeviceCode = $dc; Active = [bool]$w.Active
+                            UserFriendlyName = $fnSb.ToString().Trim(); SerialNumber = $snSb.ToString().Trim()
+                            Manufacturer     = $mfrSb.ToString().Trim(); DeviceCode = $dc; Active = [bool]$w.Active
                         })
                 }
             }
             catch { }
+
+            # Precompile token regex once per cache-miss.
+            $tokenRx = [System.Text.RegularExpressions.Regex]::new('[^A-Z0-9]+', [System.Text.RegularExpressions.RegexOptions]::Compiled)
 
             # Score a detected monitor against a CIM entry (mirrors Add-CimMonitorDetails).
             $scoreCim = {
@@ -230,16 +239,18 @@ param(
                 if ($dcu -and $du.Contains($dcu)) { $s += 10 }
                 if ($fnu -and $du.Contains($fnu)) { $s += 5 }
                 if ($cim.Active)                  { $s += 1 }
-                $dt = @([regex]::Replace($du,  '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })
-                foreach ($t in @([regex]::Replace($fnu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($dt -contains $t) { $s += 1 } }
-                foreach ($t in @([regex]::Replace($mfu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($dt -contains $t) { $s += 1 } }
+                $dtSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+                foreach ($t in ($tokenRx.Replace($du, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3) { [void]$dtSet.Add($t) } }
+                foreach ($t in ($tokenRx.Replace($fnu, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3 -and $dtSet.Contains($t)) { $s += 1 } }
+                foreach ($t in ($tokenRx.Replace($mfu, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3 -and $dtSet.Contains($t)) { $s += 1 } }
                 if (-not [string]::IsNullOrWhiteSpace($det.CapabilitiesModel)) {
                     $cmu = $det.CapabilitiesModel.ToUpperInvariant()
                     if ($fnu -and $cmu.Contains($fnu)) { $s += 8 }
                     if ($mfu -and $cmu.Contains($mfu)) { $s += 6 }
-                    $cmt = @([regex]::Replace($cmu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })
-                    foreach ($t in @([regex]::Replace($fnu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($cmt -contains $t) { $s += 2 } }
-                    foreach ($t in @([regex]::Replace($mfu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($cmt -contains $t) { $s += 2 } }
+                    $cmtSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+                    foreach ($t in ($tokenRx.Replace($cmu, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3) { [void]$cmtSet.Add($t) } }
+                    foreach ($t in ($tokenRx.Replace($fnu, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3 -and $cmtSet.Contains($t)) { $s += 2 } }
+                    foreach ($t in ($tokenRx.Replace($mfu, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3 -and $cmtSet.Contains($t)) { $s += 2 } }
                 }
                 $s
             }
@@ -248,12 +259,17 @@ param(
             $cimAssignments = @{}
             $availableCim = [System.Collections.Generic.List[pscustomobject]]::new($cimMonitors)
             foreach ($pass in @('specific', 'generic')) {
-                foreach ($det in @($detected | Where-Object { ($_.Description -eq 'Generic PnP Monitor') -eq ($pass -eq 'generic') })) {
+                $isGenericPass = ($pass -eq 'generic')
+                foreach ($det in $detected) {
+                    if (($det.Description -eq 'Generic PnP Monitor') -ne $isGenericPass) { continue }
                     if ($cimAssignments.ContainsKey($det.Id)) { continue }
-                    $best = $null; $bestScore = 0
-                    foreach ($cim in @($availableCim)) {
+                    $best = $null; $bestScore = 0; $bestActive = $false
+                    foreach ($cim in $availableCim) {
                         $s = & $scoreCim $det $cim
-                        if ($s -gt $bestScore) { $bestScore = $s; $best = $cim }
+                        $active = [bool]$cim.Active
+                        if ($s -gt $bestScore -or ($s -eq $bestScore -and $s -gt 0 -and $active -and -not $bestActive)) {
+                            $bestScore = $s; $best = $cim; $bestActive = $active
+                        }
                     }
                     if ($null -ne $best -and $bestScore -gt 1) {
                         $cimAssignments[$det.Id] = $best
@@ -263,25 +279,24 @@ param(
             }
 
             # Build enriched list with resolved descriptions.
-            $enriched = @(
-                $detected | ForEach-Object {
-                    $cim  = $cimAssignments[$_.Id]
-                    $desc = $_.Description
-                    if ($desc -eq 'Generic PnP Monitor') {
-                        if ($null -ne $cim -and -not [string]::IsNullOrWhiteSpace($cim.UserFriendlyName)) {
-                            $desc = $cim.UserFriendlyName
-                        }
-                        elseif (-not [string]::IsNullOrWhiteSpace($_.CapabilitiesModel)) {
-                            $desc = $_.CapabilitiesModel
-                        }
+            $enriched = [System.Collections.Generic.List[pscustomobject]]::new($detected.Count)
+            foreach ($det in $detected) {
+                $cim  = $cimAssignments[$det.Id]
+                $desc = $det.Description
+                if ($desc -eq 'Generic PnP Monitor') {
+                    if ($null -ne $cim -and -not [string]::IsNullOrWhiteSpace($cim.UserFriendlyName)) {
+                        $desc = $cim.UserFriendlyName
                     }
-                    [pscustomobject]@{
-                        Id          = $_.Id
-                        Description = $desc
-                        SerialNumber = if ($null -ne $cim) { $cim.SerialNumber } else { '' }
+                    elseif (-not [string]::IsNullOrWhiteSpace($det.CapabilitiesModel)) {
+                        $desc = $det.CapabilitiesModel
                     }
                 }
-            )
+                [void]$enriched.Add([pscustomobject]@{
+                    Id           = $det.Id
+                    Description  = $desc
+                    SerialNumber = if ($null -ne $cim) { $cim.SerialNumber } else { '' }
+                })
+            }
 
             # Update shared completer cache.
             $cache.DdcUtilPath = $ddcUtilPath
@@ -396,7 +411,9 @@ param(
                 }
 
                 # Check cache validity — reuse enriched data if detect returned identical monitors.
-                $detectFingerprint = ($detected | ForEach-Object { '{0}:{1}' -f $_.Id, $_.Description }) -join '|'
+                $fpParts2 = [System.Collections.Generic.List[string]]::new($detected.Count)
+                foreach ($d in $detected) { [void]$fpParts2.Add(('{0}:{1}' -f $d.Id, $d.Description)) }
+                $detectFingerprint = $fpParts2 -join '|'
                 $cacheValid = (
                     $cache.DetectFingerprint -eq $detectFingerprint -and
                     $cache.DdcUtilPath -eq $ddcUtilPath -and
@@ -423,19 +440,26 @@ param(
                 # CIM monitor details.
                 $cimMonitors = [System.Collections.Generic.List[pscustomobject]]::new()
                 try {
-                    foreach ($w in @(Get-CimInstance -ClassName WMIMonitorID -Namespace root\wmi -ErrorAction Stop)) {
-                        $fn  = (-join [char[]](@($w.UserFriendlyName | Where-Object { $_ -gt 0 }))).Trim()
-                        $sn  = (-join [char[]](@($w.SerialNumberID   | Where-Object { $_ -gt 0 }))).Trim()
-                        $mfr = (-join [char[]](@($w.ManufacturerName  | Where-Object { $_ -gt 0 }))).Trim()
+                    foreach ($w in Get-CimInstance -ClassName WMIMonitorID -Namespace root\wmi -ErrorAction Stop) {
+                        $fnSb = [System.Text.StringBuilder]::new(32)
+                        foreach ($b in $w.UserFriendlyName) { if ($b -gt 0) { [void]$fnSb.Append([char]$b) } }
+                        $snSb = [System.Text.StringBuilder]::new(32)
+                        foreach ($b in $w.SerialNumberID)   { if ($b -gt 0) { [void]$snSb.Append([char]$b) } }
+                        $mfrSb = [System.Text.StringBuilder]::new(16)
+                        foreach ($b in $w.ManufacturerName)  { if ($b -gt 0) { [void]$mfrSb.Append([char]$b) } }
                         $inst = [string]$w.InstanceName
-                        $dc  = if (($inst -split '\\').Count -ge 2) { ($inst -split '\\')[1] } else { '' }
+                        $instParts = $inst -split '\\'
+                        $dc  = if ($instParts.Count -ge 2) { $instParts[1] } else { '' }
                         [void]$cimMonitors.Add([pscustomobject]@{
-                                UserFriendlyName = $fn; SerialNumber = $sn
-                                Manufacturer     = $mfr; DeviceCode = $dc; Active = [bool]$w.Active
+                                UserFriendlyName = $fnSb.ToString().Trim(); SerialNumber = $snSb.ToString().Trim()
+                                Manufacturer     = $mfrSb.ToString().Trim(); DeviceCode = $dc; Active = [bool]$w.Active
                             })
                     }
                 }
                 catch { }
+
+                # Precompile token regex once per cache-miss.
+                $tokenRx = [System.Text.RegularExpressions.Regex]::new('[^A-Z0-9]+', [System.Text.RegularExpressions.RegexOptions]::Compiled)
 
                 # Score a detected monitor against a CIM entry (mirrors Add-CimMonitorDetails).
                 $scoreCim = {
@@ -448,16 +472,18 @@ param(
                     if ($dcu -and $du.Contains($dcu)) { $s += 10 }
                     if ($fnu -and $du.Contains($fnu)) { $s += 5 }
                     if ($cim.Active)                  { $s += 1 }
-                    $dt = @([regex]::Replace($du,  '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })
-                    foreach ($t in @([regex]::Replace($fnu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($dt -contains $t) { $s += 1 } }
-                    foreach ($t in @([regex]::Replace($mfu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($dt -contains $t) { $s += 1 } }
+                    $dtSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+                    foreach ($t in ($tokenRx.Replace($du, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3) { [void]$dtSet.Add($t) } }
+                    foreach ($t in ($tokenRx.Replace($fnu, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3 -and $dtSet.Contains($t)) { $s += 1 } }
+                    foreach ($t in ($tokenRx.Replace($mfu, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3 -and $dtSet.Contains($t)) { $s += 1 } }
                     if (-not [string]::IsNullOrWhiteSpace($det.CapabilitiesModel)) {
                         $cmu = $det.CapabilitiesModel.ToUpperInvariant()
                         if ($fnu -and $cmu.Contains($fnu)) { $s += 8 }
                         if ($mfu -and $cmu.Contains($mfu)) { $s += 6 }
-                        $cmt = @([regex]::Replace($cmu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })
-                        foreach ($t in @([regex]::Replace($fnu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($cmt -contains $t) { $s += 2 } }
-                        foreach ($t in @([regex]::Replace($mfu, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })) { if ($cmt -contains $t) { $s += 2 } }
+                        $cmtSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+                        foreach ($t in ($tokenRx.Replace($cmu, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3) { [void]$cmtSet.Add($t) } }
+                        foreach ($t in ($tokenRx.Replace($fnu, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3 -and $cmtSet.Contains($t)) { $s += 2 } }
+                        foreach ($t in ($tokenRx.Replace($mfu, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3 -and $cmtSet.Contains($t)) { $s += 2 } }
                     }
                     $s
                 }
@@ -466,12 +492,17 @@ param(
                 $cimAssignments = @{}
                 $availableCim = [System.Collections.Generic.List[pscustomobject]]::new($cimMonitors)
                 foreach ($pass in @('specific', 'generic')) {
-                    foreach ($det in @($detected | Where-Object { ($_.Description -eq 'Generic PnP Monitor') -eq ($pass -eq 'generic') })) {
+                    $isGenericPass = ($pass -eq 'generic')
+                    foreach ($det in $detected) {
+                        if (($det.Description -eq 'Generic PnP Monitor') -ne $isGenericPass) { continue }
                         if ($cimAssignments.ContainsKey($det.Id)) { continue }
-                        $best = $null; $bestScore = 0
-                        foreach ($cim in @($availableCim)) {
+                        $best = $null; $bestScore = 0; $bestActive = $false
+                        foreach ($cim in $availableCim) {
                             $s = & $scoreCim $det $cim
-                            if ($s -gt $bestScore) { $bestScore = $s; $best = $cim }
+                            $active = [bool]$cim.Active
+                            if ($s -gt $bestScore -or ($s -eq $bestScore -and $s -gt 0 -and $active -and -not $bestActive)) {
+                                $bestScore = $s; $best = $cim; $bestActive = $active
+                            }
                         }
                         if ($null -ne $best -and $bestScore -gt 1) {
                             $cimAssignments[$det.Id] = $best
@@ -481,25 +512,24 @@ param(
                 }
 
                 # Build enriched list with resolved descriptions.
-                $enriched = @(
-                    $detected | ForEach-Object {
-                        $cim  = $cimAssignments[$_.Id]
-                        $desc = $_.Description
-                        if ($desc -eq 'Generic PnP Monitor') {
-                            if ($null -ne $cim -and -not [string]::IsNullOrWhiteSpace($cim.UserFriendlyName)) {
-                                $desc = $cim.UserFriendlyName
-                            }
-                            elseif (-not [string]::IsNullOrWhiteSpace($_.CapabilitiesModel)) {
-                                $desc = $_.CapabilitiesModel
-                            }
+                $enriched = [System.Collections.Generic.List[pscustomobject]]::new($detected.Count)
+                foreach ($det in $detected) {
+                    $cim  = $cimAssignments[$det.Id]
+                    $desc = $det.Description
+                    if ($desc -eq 'Generic PnP Monitor') {
+                        if ($null -ne $cim -and -not [string]::IsNullOrWhiteSpace($cim.UserFriendlyName)) {
+                            $desc = $cim.UserFriendlyName
                         }
-                        [pscustomobject]@{
-                            Id           = $_.Id
-                            Description  = $desc
-                            SerialNumber = if ($null -ne $cim) { $cim.SerialNumber } else { '' }
+                        elseif (-not [string]::IsNullOrWhiteSpace($det.CapabilitiesModel)) {
+                            $desc = $det.CapabilitiesModel
                         }
                     }
-                )
+                    [void]$enriched.Add([pscustomobject]@{
+                        Id           = $det.Id
+                        Description  = $desc
+                        SerialNumber = if ($null -ne $cim) { $cim.SerialNumber } else { '' }
+                    })
+                }
 
                 # Update shared completer cache.
                 $cache.DdcUtilPath = $ddcUtilPath
@@ -522,17 +552,21 @@ param(
                     if ($selectedMonitors.Count -gt 0) {
                         # Token-score enriched descriptions against the last selected label to resolve
                         # the current Id — handles winddcutil detect Id instability across completions.
-                        $lastMon     = $selectedMonitors[$selectedMonitors.Count - 1]
-                        $labelUp     = $lastMon.Label.ToUpperInvariant()
-                        $labelTokens = @([regex]::Replace($labelUp, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })
-                        $resolvedId  = $lastMon.Id   # fallback: stored Id
-                        $bestTotal   = 0
+                        $lastMon = $selectedMonitors[$selectedMonitors.Count - 1]
+                        $labelUp = $lastMon.Label.ToUpperInvariant()
+                        if ($null -eq $tokenRx) { $tokenRx = [System.Text.RegularExpressions.Regex]::new('[^A-Z0-9]+', [System.Text.RegularExpressions.RegexOptions]::Compiled) }
+                        $labelTokens = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+                        foreach ($t in ($tokenRx.Replace($labelUp, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3) { [void]$labelTokens.Add($t) } }
+                        $resolvedId = $lastMon.Id
+                        $bestTotal  = 0
                         foreach ($e in $enriched) {
                             $edUp   = $e.Description.ToUpperInvariant()
-                            $edToks = @([regex]::Replace($edUp, '[^A-Z0-9]+', ' ').Trim() -split '\s+' | Where-Object { $_.Length -ge 3 })
-                            $ts     = @($labelTokens | Where-Object { $edToks -contains $_ }).Count
-                            $ib     = if ($e.Id -eq $lastMon.Id) { 1 } else { 0 }
-                            $tot    = $ts * 2 + $ib
+                            $edToks = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+                            foreach ($t in ($tokenRx.Replace($edUp, ' ').Trim() -split '\s+')) { if ($t.Length -ge 3) { [void]$edToks.Add($t) } }
+                            $ts = 0
+                            foreach ($t in $labelTokens) { if ($edToks.Contains($t)) { $ts++ } }
+                            $ib  = if ($e.Id -eq $lastMon.Id) { 1 } else { 0 }
+                            $tot = $ts * 2 + $ib
                             if ($ts -gt 0 -and $tot -gt $bestTotal) { $bestTotal = $tot; $resolvedId = $e.Id }
                         }
 
@@ -1711,27 +1745,30 @@ Returns monitor details reported by the WMIMonitorID CIM class.
             return @()
         }
 
-        return @(
-            @($query) |
-            ForEach-Object {
-                $monitor = $_
-                $instanceName = [string]$monitor.InstanceName
-                $instanceSegments = @($instanceName -split '\\')
-                $deviceCode = if ($instanceSegments.Count -ge 2) { $instanceSegments[1] } else { '' }
-
-                [pscustomobject]@{
-                    InstanceName      = $instanceName
-                    DeviceCode        = $deviceCode
-                    ComputerName      = $env:COMPUTERNAME
-                    Active            = $monitor.Active
-                    Manufacturer      = ( -join [char[]](@($monitor.ManufacturerName | Where-Object { $_ -gt 0 }))).Trim()
-                    UserFriendlyName  = ( -join [char[]](@($monitor.UserFriendlyName | Where-Object { $_ -gt 0 }))).Trim()
-                    SerialNumber      = ( -join [char[]](@($monitor.SerialNumberID | Where-Object { $_ -gt 0 }))).Trim()
-                    WeekOfManufacture = $monitor.WeekOfManufacture
-                    YearOfManufacture = $monitor.YearOfManufacture
-                }
-            }
-        )
+        $result = [System.Collections.Generic.List[pscustomobject]]::new()
+        foreach ($monitor in $query) {
+            $instanceName = [string]$monitor.InstanceName
+            $instParts = $instanceName -split '\\'
+            $deviceCode = if ($instParts.Count -ge 2) { $instParts[1] } else { '' }
+            $mfrSb = [System.Text.StringBuilder]::new(16)
+            foreach ($b in $monitor.ManufacturerName) { if ($b -gt 0) { [void]$mfrSb.Append([char]$b) } }
+            $fnSb = [System.Text.StringBuilder]::new(32)
+            foreach ($b in $monitor.UserFriendlyName)  { if ($b -gt 0) { [void]$fnSb.Append([char]$b) } }
+            $snSb = [System.Text.StringBuilder]::new(32)
+            foreach ($b in $monitor.SerialNumberID)    { if ($b -gt 0) { [void]$snSb.Append([char]$b) } }
+            [void]$result.Add([pscustomobject]@{
+                InstanceName      = $instanceName
+                DeviceCode        = $deviceCode
+                ComputerName      = $env:COMPUTERNAME
+                Active            = $monitor.Active
+                Manufacturer      = $mfrSb.ToString().Trim()
+                UserFriendlyName  = $fnSb.ToString().Trim()
+                SerialNumber      = $snSb.ToString().Trim()
+                WeekOfManufacture = $monitor.WeekOfManufacture
+                YearOfManufacture = $monitor.YearOfManufacture
+            })
+        }
+        return $result.ToArray()
     }
 
     function Get-MonitorMatchTokens {
@@ -1741,24 +1778,16 @@ Returns monitor details reported by the WMIMonitorID CIM class.
             [string[]]$Values
         )
 
-        return @(
-            foreach ($value in @($Values)) {
-                if ([string]::IsNullOrWhiteSpace($value)) {
-                    continue
-                }
-
-                $normalizedValue = ([regex]::Replace($value.ToUpperInvariant(), '[^A-Z0-9]+', ' ')).Trim()
-                if ([string]::IsNullOrWhiteSpace($normalizedValue)) {
-                    continue
-                }
-
-                foreach ($token in @($normalizedValue -split '\s+')) {
-                    if ($token.Length -ge 3) {
-                        $token
-                    }
-                }
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        foreach ($value in $Values) {
+            if ([string]::IsNullOrWhiteSpace($value)) { continue }
+            $normalizedValue = ([regex]::Replace($value.ToUpperInvariant(), '[^A-Z0-9]+', ' ')).Trim()
+            if ([string]::IsNullOrWhiteSpace($normalizedValue)) { continue }
+            foreach ($token in ($normalizedValue -split '\s+')) {
+                if ($token.Length -ge 3) { [void]$seen.Add($token) }
             }
-        ) | Select-Object -Unique
+        }
+        return [string[]]$seen
     }
 
     function Get-MonitorCapabilitiesModel {
@@ -1977,10 +2006,13 @@ PSCustomObject[]
             )
 
             $description = [string]$Monitor.Description
-            $descriptionTokens = @(Get-MonitorMatchTokens -Values @($description, $Monitor.CapabilitiesModel))
+            $descriptionTokens = [System.Collections.Generic.HashSet[string]]::new(
+                [string[]](Get-MonitorMatchTokens -Values @($description, $Monitor.CapabilitiesModel)),
+                [System.StringComparer]::Ordinal
+            )
             $candidateTokens = @(Get-MonitorMatchTokens -Values @($CimMonitor.UserFriendlyName, $CimMonitor.Manufacturer, $CimMonitor.DeviceCode))
-            $sharedTokens = @($candidateTokens | Where-Object { $descriptionTokens -contains $_ })
-            $score = $sharedTokens.Count
+            $score = 0
+            foreach ($t in $candidateTokens) { if ($descriptionTokens.Contains($t)) { $score++ } }
 
             if (-not [string]::IsNullOrWhiteSpace($CimMonitor.DeviceCode) -and $description.ToUpperInvariant().Contains($CimMonitor.DeviceCode.ToUpperInvariant())) {
                 $score += 10
@@ -2063,54 +2095,44 @@ PSCustomObject[]
             return [pscustomobject]$result
         }
 
-        $availableCimMonitors = [System.Collections.Generic.List[object]]::new()
-        foreach ($cimMonitor in @($CimMonitorDetails)) {
-            [void]$availableCimMonitors.Add($cimMonitor)
-        }
+        $availableCimMonitors = [System.Collections.Generic.List[object]]::new($CimMonitorDetails)
 
         $assignments = @{}
         $detectedMonitors = @($Monitors)
 
-        foreach ($monitor in @($detectedMonitors | Where-Object { $_.Description -ne 'Generic PnP Monitor' })) {
-            $candidate = @(
-                @($availableCimMonitors) |
-                ForEach-Object {
-                    [pscustomobject]@{
-                        CimMonitor = $_
-                        Score      = Get-MonitorMatchScore -Monitor $monitor -CimMonitor $_
+        foreach ($monitor in $detectedMonitors) {
+            if ($monitor.Description -eq 'Generic PnP Monitor') { continue }
+            $bestCim = $null; $bestScore = 0; $bestActive = $false
+            foreach ($cim in $availableCimMonitors) {
+                $s = Get-MonitorMatchScore -Monitor $monitor -CimMonitor $cim
+                if ($s -gt 0) {
+                    $active = [bool]$cim.Active
+                    if ($s -gt $bestScore -or ($s -eq $bestScore -and $active -and -not $bestActive)) {
+                        $bestScore = $s; $bestCim = $cim; $bestActive = $active
                     }
-                } |
-                Where-Object { $_.Score -gt 0 } |
-                Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = { [bool]$_.CimMonitor.Active }; Descending = $true }
-            ) | Select-Object -First 1
-
-            if ($null -ne $candidate) {
-                $assignments[[string]$monitor.Id] = $candidate.CimMonitor
-                [void]$availableCimMonitors.Remove($candidate.CimMonitor)
+                }
+            }
+            if ($null -ne $bestCim) {
+                $assignments[[string]$monitor.Id] = $bestCim
+                [void]$availableCimMonitors.Remove($bestCim)
             }
         }
 
-        foreach ($monitor in @($detectedMonitors | Where-Object { -not $assignments.ContainsKey([string]$_.Id) })) {
-            $selectedCimMonitor = $null
-            $candidate = @(
-                @($availableCimMonitors) |
-                ForEach-Object {
-                    [pscustomobject]@{
-                        CimMonitor = $_
-                        Score      = Get-MonitorMatchScore -Monitor $monitor -CimMonitor $_
+        foreach ($monitor in $detectedMonitors) {
+            if ($assignments.ContainsKey([string]$monitor.Id)) { continue }
+            $bestCim = $null; $bestScore = 0; $bestActive = $false
+            foreach ($cim in $availableCimMonitors) {
+                $s = Get-MonitorMatchScore -Monitor $monitor -CimMonitor $cim
+                if ($s -gt 0) {
+                    $active = [bool]$cim.Active
+                    if ($s -gt $bestScore -or ($s -eq $bestScore -and $active -and -not $bestActive)) {
+                        $bestScore = $s; $bestCim = $cim; $bestActive = $active
                     }
-                } |
-                Where-Object { $_.Score -gt 0 } |
-                Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = { [bool]$_.CimMonitor.Active }; Descending = $true }
-            ) | Select-Object -First 1
-
-            if ($null -ne $candidate) {
-                $selectedCimMonitor = $candidate.CimMonitor
+                }
             }
-
-            if ($null -ne $selectedCimMonitor) {
-                $assignments[[string]$monitor.Id] = $selectedCimMonitor
-                [void]$availableCimMonitors.Remove($selectedCimMonitor)
+            if ($null -ne $bestCim) {
+                $assignments[[string]$monitor.Id] = $bestCim
+                [void]$availableCimMonitors.Remove($bestCim)
             }
         }
 
@@ -2652,19 +2674,20 @@ reasons that triggered the reset.
         if ($logFile.Length -gt $MaxLogSizeBytes) {
             [void]$reasons.Add("size $($logFile.Length) bytes exceeds $MaxLogSizeBytes bytes")
         }
+        elseif ($logFile.Length -gt 0) {
+            $firstEntry = Get-Content -LiteralPath $LogPath -TotalCount 1 -ErrorAction Stop
+            if (-not [string]::IsNullOrWhiteSpace($firstEntry)) {
+                $timestampMatch = [regex]::Match($firstEntry, '^\[(?<Timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]')
+                if ($timestampMatch.Success) {
+                    $oldestEntryTimestamp = [datetime]::ParseExact(
+                        $timestampMatch.Groups['Timestamp'].Value,
+                        'yyyy-MM-dd HH:mm:ss',
+                        [System.Globalization.CultureInfo]::InvariantCulture
+                    )
 
-        $firstEntry = Get-Content -LiteralPath $LogPath -TotalCount 1 -ErrorAction Stop
-        if (-not [string]::IsNullOrWhiteSpace($firstEntry)) {
-            $timestampMatch = [regex]::Match($firstEntry, '^\[(?<Timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]')
-            if ($timestampMatch.Success) {
-                $oldestEntryTimestamp = [datetime]::ParseExact(
-                    $timestampMatch.Groups['Timestamp'].Value,
-                    'yyyy-MM-dd HH:mm:ss',
-                    [System.Globalization.CultureInfo]::InvariantCulture
-                )
-
-                if ($oldestEntryTimestamp -lt (Get-Date).Subtract($MaxLogAge)) {
-                    [void]$reasons.Add("oldest entry $($oldestEntryTimestamp.ToString('yyyy-MM-dd HH:mm:ss')) is older than $([int]$MaxLogAge.TotalDays) days")
+                    if ($oldestEntryTimestamp -lt (Get-Date).Subtract($MaxLogAge)) {
+                        [void]$reasons.Add("oldest entry $($oldestEntryTimestamp.ToString('yyyy-MM-dd HH:mm:ss')) is older than $([int]$MaxLogAge.TotalDays) days")
+                    }
                 }
             }
         }
