@@ -1989,11 +1989,9 @@ PSCustomObject[]
     function Add-CimMonitorDetails {
         [CmdletBinding()]
         param(
-            [Parameter(Mandatory)]
-            [object[]]$Monitors,
+            [object[]]$Monitors = @(),
 
-            [Parameter(Mandatory)]
-            [object[]]$CimMonitorDetails
+            [object[]]$CimMonitorDetails = @()
         )
 
         function Get-MonitorMatchScore {
