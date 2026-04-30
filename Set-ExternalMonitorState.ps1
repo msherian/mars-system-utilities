@@ -1191,7 +1191,7 @@ Writes an informational log entry.
                     ParentProcessId = [int]$processRecord.ParentProcessId
                     Name            = [string]$processObject.ProcessName
                     CommandLine     = [string]$processRecord.CommandLine
-                    StartTime       = [datetime]$processObject.StartTime
+                    StartTime       = if ($null -ne $processObject.StartTime) { [datetime]$processObject.StartTime } else { [datetime]::MinValue }
                 })
 
             if ($processRecord.ParentProcessId -le 0 -or $processRecord.ParentProcessId -eq $processRecord.ProcessId) {
