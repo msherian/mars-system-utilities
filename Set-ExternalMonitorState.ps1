@@ -151,7 +151,7 @@ param(
                     $si.RedirectStandardOutput = $true
                     $si.RedirectStandardError = $true
                     $si.CreateNoWindow = $true
-                    foreach ($a in $CmdArgs) { [void]$si.ArgumentList.Add($a) }
+                    $si.Arguments = $CmdArgs -join ' '
                     $p = [System.Diagnostics.Process]::new()
                     $p.StartInfo = $si
                     [void]$p.Start()
@@ -384,7 +384,7 @@ param(
                         $si.RedirectStandardOutput = $true
                         $si.RedirectStandardError = $true
                         $si.CreateNoWindow = $true
-                        foreach ($a in $CmdArgs) { [void]$si.ArgumentList.Add($a) }
+                        $si.Arguments = $CmdArgs -join ' '
                         $p = [System.Diagnostics.Process]::new()
                         $p.StartInfo = $si
                         [void]$p.Start()
@@ -1535,22 +1535,7 @@ Sets the input source for display 3 to the specified VCP value.
             $startInfo.RedirectStandardError = $true
             $startInfo.CreateNoWindow = $true
 
-            [void]$startInfo.ArgumentList.Add($commandName)
-
-            switch ($PSCmdlet.ParameterSetName) {
-                'capabilities' {
-                    [void]$startInfo.ArgumentList.Add($Display)
-                }
-                'setvcp' {
-                    [void]$startInfo.ArgumentList.Add($Display)
-                    [void]$startInfo.ArgumentList.Add($FeatureCode)
-                    [void]$startInfo.ArgumentList.Add($NewValue)
-                }
-                'getvcp' {
-                    [void]$startInfo.ArgumentList.Add($Display)
-                    [void]$startInfo.ArgumentList.Add($FeatureCode)
-                }
-            }
+            $startInfo.Arguments = $resultArguments -join ' '
 
             $process = [System.Diagnostics.Process]::new()
             $process.StartInfo = $startInfo
@@ -1671,7 +1656,7 @@ Returns all detected monitors as objects.
             $startInfo.RedirectStandardOutput = $true
             $startInfo.RedirectStandardError = $true
             $startInfo.CreateNoWindow = $true
-            [void]$startInfo.ArgumentList.Add('detect')
+            $startInfo.Arguments = 'detect'
 
             $process = [System.Diagnostics.Process]::new()
             $process.StartInfo = $startInfo
